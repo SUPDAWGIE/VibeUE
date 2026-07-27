@@ -22,7 +22,9 @@
 #include "K2Node_CallArrayFunction.h"   // For array library functions with wildcard pins
 #include "K2Node_GetArrayItem.h"        // For Array Get (replaces deprecated Array_Get)
 #include "K2Node_CreateDelegate.h"
+#include "K2Node_ComponentBoundEvent.h"
 #include "K2Node_CustomEvent.h"
+#include "EdGraphSchema_K2_Actions.h"
 #include "K2Node_DynamicCast.h"
 #include "K2Node_Event.h"
 #include "K2Node_EnhancedInputAction.h"  // For Enhanced Input Action event nodes
@@ -75,6 +77,12 @@
 #include "AssetRegistry/ARFilter.h"          // For FARFilter (resolve original material asset path)
 // For FScopedTransaction (undo support)
 #include "ScopedTransaction.h"
+// For AnalyzeGraphLayout JSON report
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
+#include "Serialization/JsonWriter.h"
+#include "Serialization/JsonSerializer.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
 
 namespace
 {
@@ -1534,6 +1542,27 @@ bool UBlueprintService::SetRootComponent(
 	// the auto-generated DefaultSceneRoot while the old root is being detached below.
 	SCS->AddNode(NewRootNode);
 
+	// RemoveChildNode/RemoveNode do NOT clear the serialized parent linkage. A root
+	// node that still names a parent deserializes as attached — after save+reload the
+	// SCS has no root and the cooker fires the cyclic-SCS ensure (issue #371).
+	NewRootNode->ParentComponentOrVariableName = NAME_None;
+	NewRootNode->ParentComponentOwnerClassName = NAME_None;
+	NewRootNode->bIsParentComponentNative = false;
+
+	// Attach a node as a same-SCS child of the new root. ParentComponentOrVariableName
+	// is reserved for attachment to INHERITED (parent-class/native) components — the
+	// engine's hierarchy fixup fires the "possible cyclic linkage" ensure on load/cook
+	// when it names the node's own SCS parent (issue #371). Same-SCS attachment is the
+	// ChildNodes array alone, with the inherited-parent linkage cleared.
+	auto AttachUnderNewRoot = [NewRootNode](USCS_Node* Child)
+	{
+		NewRootNode->AddChildNode(Child);
+		Child->Modify();
+		Child->ParentComponentOrVariableName = NAME_None;
+		Child->ParentComponentOwnerClassName = NAME_None;
+		Child->bIsParentComponentNative = false;
+	};
+
 	// If there was a current root, we need to handle it
 	if (CurrentRootNode && CurrentRootNode != NewRootNode)
 	{
@@ -1550,9 +1579,7 @@ bool UBlueprintService::SetRootComponent(
 		if (CurrentRootNode != SCS->GetDefaultSceneRootNode())
 		{
 			// Make the old user-created root a child of the new root
-			NewRootNode->AddChildNode(CurrentRootNode);
-			// CRITICAL: Call SetParent to properly set ParentComponentOrVariableName
-			CurrentRootNode->SetParent(NewRootNode);
+			AttachUnderNewRoot(CurrentRootNode);
 		}
 		// The auto-generated DefaultSceneRoot is dropped outright (matching the Blueprint
 		// editor); the SCS recreates it automatically if the blueprint ever needs one again.
@@ -1563,9 +1590,7 @@ bool UBlueprintService::SetRootComponent(
 	{
 		if (Child && Child != NewRootNode && Child != CurrentRootNode)
 		{
-			NewRootNode->AddChildNode(Child);
-			// CRITICAL: Call SetParent to properly set ParentComponentOrVariableName
-			Child->SetParent(NewRootNode);
+			AttachUnderNewRoot(Child);
 		}
 	}
 
@@ -1584,13 +1609,24 @@ bool UBlueprintService::SetRootComponent(
 	for (USCS_Node* Node : OtherSceneRoots)
 	{
 		SCS->RemoveNode(Node);
-		NewRootNode->AddChildNode(Node);
-		Node->SetParent(NewRootNode);
+		AttachUnderNewRoot(Node);
 	}
+
+	// Let the SCS reconcile its RootNodes/default-root state before the compile —
+	// this is what persists the root designation through save+reload (issue #371).
+	SCS->ValidateSceneRootNodes();
 
 	// Mark blueprint as structurally modified
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
-	
+
+	// Verify the promoted node actually reads back as the scene root; report the
+	// failure instead of claiming success (issue #352: no silent failures).
+	if (FindActualSceneRootNode(SCS) != NewRootNode)
+	{
+		UE_LOG(LogTemp, Error, TEXT("SetRootComponent: '%s' did not persist as scene root of %s after validation"), *ComponentName, *BlueprintPath);
+		return false;
+	}
+
 	UE_LOG(LogTemp, Log, TEXT("SetRootComponent: Set '%s' as root component in %s"), *ComponentName, *BlueprintPath);
 	return true;
 }
@@ -1811,6 +1847,54 @@ bool UBlueprintService::ReparentComponent(
 // ============================================================================
 // VARIABLE MANAGEMENT (Phase 1)
 // ============================================================================
+
+bool UBlueprintService::AddMemberVariable(
+	const FString& BlueprintPath,
+	const FString& VariableName,
+	const FString& VariableType,
+	const FString& DefaultValue,
+	bool bIsArray,
+	const FString& ContainerType)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddMemberVariable: Failed to load blueprint: %s"), *BlueprintPath);
+		return false;
+	}
+
+	for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+	{
+		if (Var.VarName.ToString() == VariableName)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("AddMemberVariable: Variable '%s' already exists in %s"), *VariableName, *BlueprintPath);
+			return false;
+		}
+	}
+
+	FEdGraphPinType PinType;
+	FString ErrorMessage;
+	if (!FBlueprintTypeParser::ParseTypeString(VariableType, PinType, bIsArray, ContainerType, ErrorMessage))
+	{
+		UE_LOG(LogTemp, Error, TEXT("AddMemberVariable: Failed to parse type '%s': %s"), *VariableType, *ErrorMessage);
+		return false;
+	}
+
+	FBPVariableDescription NewVar;
+	NewVar.VarName = FName(*VariableName);
+	NewVar.VarGuid = FGuid::NewGuid();
+	NewVar.VarType = PinType;
+	NewVar.FriendlyName = VariableName;
+	NewVar.Category = FText::FromString(TEXT("Default"));
+	NewVar.DefaultValue = DefaultValue;
+	NewVar.PropertyFlags = CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
+
+	Blueprint->NewVariables.Add(NewVar);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+	UE_LOG(LogTemp, Log, TEXT("AddMemberVariable: Added variable '%s' of type '%s' to %s"), *VariableName, *VariableType, *BlueprintPath);
+	return true;
+}
 
 bool UBlueprintService::SetVariableDefaultValue(
 	const FString& BlueprintPath,
@@ -3119,6 +3203,87 @@ FString UBlueprintService::AddCustomEventNode(
 	UE_LOG(LogTemp, Log, TEXT("AddCustomEventNode: Added custom event '%s' in %s"), *EventName, *GraphName);
 
 	return SpawnedNode->NodeGuid.ToString();
+}
+
+FString UBlueprintService::CreateComponentBoundEvent(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	const FString& ComponentName,
+	const FString& DelegateName,
+	float PosX,
+	float PosY)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Error, TEXT("CreateComponentBoundEvent: Failed to load blueprint: %s"), *BlueprintPath);
+		return FString();
+	}
+
+	UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName);
+	if (!Graph)
+	{
+		UE_LOG(LogTemp, Error, TEXT("CreateComponentBoundEvent: Graph '%s' not found in %s"), *GraphName, *BlueprintPath);
+		return FString();
+	}
+	if (!Blueprint->UbergraphPages.Contains(Graph))
+	{
+		UE_LOG(LogTemp, Error, TEXT("CreateComponentBoundEvent: Graph '%s' is not an event graph — bound events only live in ubergraphs"), *GraphName);
+		return FString();
+	}
+
+	// The component variable is a property on the (skeleton) generated class.
+	UClass* OwnerClass = Blueprint->SkeletonGeneratedClass ? Blueprint->SkeletonGeneratedClass : Blueprint->GeneratedClass;
+	if (!OwnerClass)
+	{
+		UE_LOG(LogTemp, Error, TEXT("CreateComponentBoundEvent: %s has no generated class — compile the blueprint first"), *BlueprintPath);
+		return FString();
+	}
+
+	FObjectProperty* ComponentProperty = FindFProperty<FObjectProperty>(OwnerClass, *ComponentName);
+	if (!ComponentProperty)
+	{
+		UE_LOG(LogTemp, Error, TEXT("CreateComponentBoundEvent: Component variable '%s' not found on %s (is it marked as a variable?)"), *ComponentName, *OwnerClass->GetName());
+		return FString();
+	}
+
+	const FMulticastDelegateProperty* DelegateProperty = FindFProperty<FMulticastDelegateProperty>(ComponentProperty->PropertyClass, *DelegateName);
+	if (!DelegateProperty)
+	{
+		UE_LOG(LogTemp, Error, TEXT("CreateComponentBoundEvent: Delegate '%s' not found on component class %s"), *DelegateName, *ComponentProperty->PropertyClass->GetName());
+		return FString();
+	}
+
+	// Idempotent: a component+delegate pair can only have one bound event in a
+	// blueprint — reuse it rather than creating a dead duplicate.
+	if (const UK2Node_ComponentBoundEvent* Existing = FKismetEditorUtilities::FindBoundEventForComponent(Blueprint, DelegateProperty->GetFName(), ComponentProperty->GetFName()))
+	{
+		UE_LOG(LogTemp, Log, TEXT("CreateComponentBoundEvent: Bound event for %s.%s already exists — returning existing node"), *ComponentName, *DelegateName);
+		return Existing->NodeGuid.ToString();
+	}
+
+	// Same path as the Designer's green "+": spawn the node and atomically
+	// initialize the binding params (ComponentPropertyName, DelegatePropertyName,
+	// EventReference, and the generated CustomFunctionName the compiler registers
+	// the runtime handler under). See FKismetEditorUtilities::CreateNewBoundEventForClass.
+	UK2Node_ComponentBoundEvent* NewNode = FEdGraphSchemaAction_K2NewNode::SpawnNode<UK2Node_ComponentBoundEvent>(
+		Graph,
+		FVector2D(PosX, PosY),
+		EK2NewNodeFlags::None,
+		[ComponentProperty, DelegateProperty](UK2Node_ComponentBoundEvent* NewInstance)
+		{
+			NewInstance->InitializeComponentBoundEventParams(ComponentProperty, DelegateProperty);
+		});
+	if (!NewNode)
+	{
+		UE_LOG(LogTemp, Error, TEXT("CreateComponentBoundEvent: Failed to spawn bound event node for %s.%s"), *ComponentName, *DelegateName);
+		return FString();
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+	UE_LOG(LogTemp, Log, TEXT("CreateComponentBoundEvent: Created bound event %s.%s in %s"), *ComponentName, *DelegateName, *GraphName);
+
+	return NewNode->NodeGuid.ToString();
 }
 
 // Returns true if the editable-pin node already has a user-defined pin with this name.
@@ -4473,7 +4638,10 @@ bool UBlueprintService::ConnectNodes(
 
 TArray<FBlueprintNodeInfo> UBlueprintService::GetNodesInGraph(
 	const FString& BlueprintPath,
-	const FString& GraphName)
+	const FString& GraphName,
+	int32 MaxNodes,
+	const FString& NameFilter,
+	bool bIncludePins)
 {
 	TArray<FBlueprintNodeInfo> NodeInfos;
 
@@ -4503,28 +4671,117 @@ TArray<FBlueprintNodeInfo> UBlueprintService::GetNodesInGraph(
 		NodeInfo.PosX = Node->NodePosX;
 		NodeInfo.PosY = Node->NodePosY;
 
-		// Get pin names (for quick reference)
-		for (UEdGraphPin* Pin : Node->Pins)
+		if (!NameFilter.IsEmpty()
+			&& !NodeInfo.NodeTitle.Contains(NameFilter)
+			&& !NodeInfo.NodeType.Contains(NameFilter)
+			&& !NodeInfo.NodeId.Contains(NameFilter))
 		{
-			if (Pin)
-			{
-				NodeInfo.PinNames.Add(Pin->PinName.ToString());
+			continue;
+		}
 
-				// Also add detailed pin info
-				FBlueprintPinInfo PinInfo;
-				PinInfo.PinName = Pin->PinName.ToString();
-				PinInfo.PinType = Pin->PinType.PinCategory.ToString();
-				PinInfo.bIsInput = (Pin->Direction == EGPD_Input);
-				PinInfo.bIsConnected = Pin->LinkedTo.Num() > 0;
-				PinInfo.DefaultValue = Pin->DefaultValue;
-				NodeInfo.Pins.Add(PinInfo);
+		if (bIncludePins)
+		{
+			// Get pin names (for quick reference)
+			for (UEdGraphPin* Pin : Node->Pins)
+			{
+				if (Pin)
+				{
+					NodeInfo.PinNames.Add(Pin->PinName.ToString());
+
+					// Also add detailed pin info
+					FBlueprintPinInfo PinInfo;
+					PinInfo.PinName = Pin->PinName.ToString();
+					PinInfo.PinType = Pin->PinType.PinCategory.ToString();
+					PinInfo.bIsInput = (Pin->Direction == EGPD_Input);
+					PinInfo.bIsConnected = Pin->LinkedTo.Num() > 0;
+					PinInfo.DefaultValue = Pin->DefaultValue;
+					NodeInfo.Pins.Add(PinInfo);
+				}
 			}
 		}
 
 		NodeInfos.Add(NodeInfo);
+
+		if (MaxNodes > 0 && NodeInfos.Num() >= MaxNodes)
+		{
+			break;
+		}
 	}
 
 	return NodeInfos;
+}
+
+bool UBlueprintService::GetGraphSummary(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	FBlueprintGraphSummary& OutSummary)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("GetGraphSummary: Failed to load blueprint: %s"), *BlueprintPath);
+		return false;
+	}
+
+	UEdGraph* Graph = FindGraph(Blueprint, GraphName);
+	if (!Graph)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("GetGraphSummary: Graph '%s' not found in %s"), *GraphName, *BlueprintPath);
+		return false;
+	}
+
+	OutSummary.GraphName = Graph->GetName();
+
+	OutSummary.GraphKind = TEXT("Ubergraph");
+	if (Blueprint->FunctionGraphs.Contains(Graph)) { OutSummary.GraphKind = TEXT("Function"); }
+	else if (Blueprint->MacroGraphs.Contains(Graph)) { OutSummary.GraphKind = TEXT("Macro"); }
+	else if (Blueprint->DelegateSignatureGraphs.Contains(Graph)) { OutSummary.GraphKind = TEXT("DelegateSignature"); }
+
+	switch (Blueprint->Status)
+	{
+	case BS_UpToDate:             OutSummary.CompileStatus = TEXT("UpToDate"); break;
+	case BS_UpToDateWithWarnings: OutSummary.CompileStatus = TEXT("UpToDateWithWarnings"); break;
+	case BS_Dirty:                OutSummary.CompileStatus = TEXT("Dirty"); break;
+	case BS_Error:                OutSummary.CompileStatus = TEXT("Error"); break;
+	default:                      OutSummary.CompileStatus = TEXT("Unknown"); break;
+	}
+
+	OutSummary.NodeCount = 0;
+	OutSummary.ConnectionCount = 0;
+	TMap<FString, int32> TypeCounts;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (!Node)
+		{
+			continue;
+		}
+		OutSummary.NodeCount++;
+		TypeCounts.FindOrAdd(Node->GetClass()->GetName())++;
+
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			// Count each link once, from its output side.
+			if (Pin && Pin->Direction == EGPD_Output)
+			{
+				OutSummary.ConnectionCount += Pin->LinkedTo.Num();
+			}
+		}
+
+		if (Node->IsA<UK2Node_Event>() || Node->IsA<UK2Node_FunctionEntry>())
+		{
+			OutSummary.EntryPoints.Add(FString::Printf(TEXT("%s|%s"),
+				*Node->GetNodeTitle(ENodeTitleType::ListView).ToString(),
+				*Node->NodeGuid.ToString()));
+		}
+	}
+
+	TypeCounts.ValueSort([](int32 A, int32 B) { return A > B; });
+	for (const TPair<FString, int32>& Pair : TypeCounts)
+	{
+		OutSummary.NodeTypeCounts.Add(FString::Printf(TEXT("%s x%d"), *Pair.Key, Pair.Value));
+	}
+
+	return true;
 }
 
 namespace
@@ -5481,9 +5738,15 @@ bool UBlueprintService::SetProperty(
 		return false;
 	}
 
-	// Import property value from string
+	// Import property value from string. ImportText returns null on parse failure —
+	// report it instead of saving an unchanged asset and claiming success (issue #352).
 	void* PropertyAddr = Property->ContainerPtrToValuePtr<void>(CDO);
-	Property->ImportText_Direct(*PropertyValue, PropertyAddr, nullptr, PPF_None);
+	if (!Property->ImportText_Direct(*PropertyValue, PropertyAddr, CDO, PPF_None))
+	{
+		UE_LOG(LogTemp, Error, TEXT("SetProperty: Failed to parse '%s' for property '%s' (%s) — value rejected by ImportText"),
+			*PropertyValue, *PropertyName, *Property->GetClass()->GetName());
+		return false;
+	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 	UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
@@ -6672,15 +6935,18 @@ bool UBlueprintService::ConfigureNode(
 			return false;
 		}
 	}
-	else if (FSoftClassProperty* SoftClassProp = CastField<FSoftClassProperty>(Property))
-	{
-		// Use generic import for soft class references
-		Property->ImportText_Direct(*Value, PropertyAddr, nullptr, PPF_None);
-	}
 	else
 	{
-		// Use generic import
-		Property->ImportText_Direct(*Value, PropertyAddr, nullptr, PPF_None);
+		// Generic import (soft class refs included). ImportText returns null when the
+		// value fails to parse (e.g. a bare string handed to a struct property) — a
+		// silent no-op unless we surface it (issue #386).
+		const TCHAR* ImportResult = Property->ImportText_Direct(*Value, PropertyAddr, nullptr, PPF_None);
+		if (!ImportResult)
+		{
+			UE_LOG(LogTemp, Error, TEXT("ConfigureNode: Failed to parse '%s' for property '%s' (%s) on node '%s' — value rejected by ImportText"),
+				*Value, *PropertyName, *Property->GetClass()->GetName(), *NodeId);
+			return false;
+		}
 	}
 
 	// Reconstruct node to apply changes
@@ -6787,6 +7053,17 @@ FString UBlueprintService::CreateNodeByKey(
 				}
 			}
 
+			// Idempotent: a named custom event already in the blueprint is returned
+			// instead of duplicated — a second same-named event is a compile error.
+			if (!CustomEventName.IsNone())
+			{
+				if (UK2Node_Event* Existing = FBlueprintEditorUtils::FindCustomEventNode(Blueprint, CustomEventName))
+				{
+					UE_LOG(LogTemp, Log, TEXT("CreateNodeByKey: Custom event '%s' already exists — returning existing node"), *CustomEventName.ToString());
+					return Existing->NodeGuid.ToString();
+				}
+			}
+
 			EventSpawner = UBlueprintEventNodeSpawner::Create(UK2Node_CustomEvent::StaticClass(), CustomEventName);
 		}
 		else
@@ -6811,6 +7088,17 @@ FString UBlueprintService::CreateNodeByKey(
 			{
 				UE_LOG(LogTemp, Error, TEXT("CreateNodeByKey: Event function '%s' not found in class '%s'"), *FunctionName, *ClassName);
 				return FString();
+			}
+
+			// Idempotent: an override event (BeginPlay/Tick/overlap/...) can exist only
+			// once per blueprint. Creating a second one yields two same-named event nodes
+			// that both error out ("found more than one function with the same name") and
+			// the graph looks "not connected" (issue #349). Do what the editor does on
+			// double-click: return the existing node.
+			if (UK2Node_Event* Existing = FBlueprintEditorUtils::FindOverrideForFunction(Blueprint, EventFunction->GetOwnerClass(), EventFunction->GetFName()))
+			{
+				UE_LOG(LogTemp, Log, TEXT("CreateNodeByKey: Override event '%s' already exists in %s — returning existing node"), *FunctionName, *BlueprintPath);
+				return Existing->NodeGuid.ToString();
 			}
 
 			EventSpawner = UBlueprintEventNodeSpawner::Create(EventFunction);
@@ -8796,6 +9084,14 @@ UEdGraphNode* UBlueprintService::CreateNodeFromDesc(
 // BuildGraph
 // ────────────────────────────────────────────────────────────────
 
+// Defined with the layout algorithm further down; declared here because BuildGraph's
+// comment-box phase needs the same estimated node geometry.
+namespace VibeUELayout
+{
+	static float EstimateNodeHeight(const UEdGraphNode* Node);
+	static float EstimateNodeWidth(const UEdGraphNode* Node);
+}
+
 bool UBlueprintService::BuildGraph(
 	const FString& BlueprintPath,
 	const FString& GraphName,
@@ -8833,6 +9129,10 @@ bool UBlueprintService::BuildGraph(
 
 	// Map from local ref → created node pointer
 	TMap<FString, UEdGraphNode*> RefToNode;
+
+	// Optional "group":"<title>" param on any node descriptor → members of a comment box
+	// created after layout (Phase 4.5). Insertion-ordered so box creation is deterministic.
+	TMap<FString, TArray<UEdGraphNode*>> GroupMembers;
 
 	// ── Phase 1: Create Nodes ──
 	UE_LOG(LogTemp, Log, TEXT("BuildGraph: Creating %d nodes in %s::%s"), Nodes.Num(), *BlueprintPath, *GraphName);
@@ -8873,6 +9173,13 @@ bool UBlueprintService::BuildGraph(
 			RefToNode.Add(Desc.Ref, NewNode);
 			OutResult.RefToNodeId.Add(Desc.Ref, NewNode->NodeGuid.ToString());
 			OutResult.NodesCreated++;
+			if (const FString* Group = Desc.Params.Find(TEXT("group")))
+			{
+				if (!Group->IsEmpty())
+				{
+					GroupMembers.FindOrAdd(*Group).Add(NewNode);
+				}
+			}
 			UE_LOG(LogTemp, Log, TEXT("BuildGraph: Created node '%s' (%s) → %s"), *Desc.Ref, *Desc.Type, *NewNode->NodeGuid.ToString());
 		}
 		else
@@ -9032,6 +9339,32 @@ bool UBlueprintService::BuildGraph(
 		}
 	}
 
+	// ── Phase 4.5: Comment boxes for "group" hints ──
+	// Runs after layout so each box wraps its members' final positions. The comment's
+	// GUID is surfaced in RefToNodeId under "group:<title>".
+	for (const TPair<FString, TArray<UEdGraphNode*>>& Group : GroupMembers)
+	{
+		float MinX = FLT_MAX, MinY = FLT_MAX, MaxX = -FLT_MAX, MaxY = -FLT_MAX;
+		for (UEdGraphNode* N : Group.Value)
+		{
+			MinX = FMath::Min(MinX, (float)N->NodePosX);
+			MinY = FMath::Min(MinY, (float)N->NodePosY);
+			MaxX = FMath::Max(MaxX, (float)N->NodePosX + VibeUELayout::EstimateNodeWidth(N));
+			MaxY = FMath::Max(MaxY, (float)N->NodePosY + VibeUELayout::EstimateNodeHeight(N));
+		}
+		UEdGraphNode_Comment* CommentNode = NewObject<UEdGraphNode_Comment>(Graph);
+		CommentNode->NodePosX = (int32)(MinX - 32.0f);
+		CommentNode->NodePosY = (int32)(MinY - 56.0f);
+		CommentNode->NodeWidth = (int32)((MaxX - MinX) + 64.0f);
+		CommentNode->NodeHeight = (int32)((MaxY - MinY) + 96.0f);
+		CommentNode->NodeComment = Group.Key;
+		Graph->AddNode(CommentNode, false, false);
+		CommentNode->CreateNewGuid();
+		CommentNode->PostPlacedNewNode();
+		OutResult.RefToNodeId.Add(FString::Printf(TEXT("group:%s"), *Group.Key), CommentNode->NodeGuid.ToString());
+		UE_LOG(LogTemp, Log, TEXT("BuildGraph: Created comment box '%s' around %d nodes"), *Group.Key, Group.Value.Num());
+	}
+
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
 	// ── Phase 5: Compile ──
@@ -9096,6 +9429,49 @@ namespace VibeUELayout
 		return 72.0f + (float)Rows * 26.0f;
 	}
 
+	static float EstimateNodeWidth(const UEdGraphNode* Node)
+	{
+		// Approximate the rendered widget: header sized by title, body sized by the
+		// longest input + output pin label pair (~7 px/char at 1:1 zoom).
+		const FString Title = Node->GetNodeTitle(ENodeTitleType::ListView).ToString();
+		int32 MaxIn = 0, MaxOut = 0;
+		for (const UEdGraphPin* P : Node->Pins)
+		{
+			if (!P || P->bHidden) continue;
+			const int32 Len = (P->PinFriendlyName.IsEmpty() ? P->PinName.ToString() : P->PinFriendlyName.ToString()).Len();
+			if (P->Direction == EGPD_Input) { MaxIn = FMath::Max(MaxIn, Len); }
+			else { MaxOut = FMath::Max(MaxOut, Len); }
+		}
+		const float TitleW = 48.0f + (float)Title.Len() * 7.0f;
+		const float PinsW = 64.0f + (float)(MaxIn + MaxOut) * 7.0f;
+		return FMath::Clamp(FMath::Max(TitleW, PinsW), 140.0f, 560.0f);
+	}
+
+	// Center-Y offset of a pin's row within its node, using the same geometry model as
+	// EstimateNodeHeight (header ≈46 px, then 26 px per visible pin row per direction).
+	static float PinRowCenterY(const UEdGraphNode* Node, const UEdGraphPin* Pin)
+	{
+		int32 Row = 0;
+		for (const UEdGraphPin* P : Node->Pins)
+		{
+			if (!P || P->bHidden || P->Direction != Pin->Direction) continue;
+			if (P == Pin) break;
+			++Row;
+		}
+		return 46.0f + (float)Row * 26.0f;
+	}
+
+	// Strict segment intersection (shared endpoints / collinear touches don't count).
+	static bool SegmentsIntersect(const FVector2D& A, const FVector2D& B, const FVector2D& C, const FVector2D& D)
+	{
+		auto Cross = [](const FVector2D& O, const FVector2D& P, const FVector2D& Q)
+		{
+			return (P.X - O.X) * (Q.Y - O.Y) - (P.Y - O.Y) * (Q.X - O.X);
+		};
+		const double d1 = Cross(C, D, A), d2 = Cross(C, D, B), d3 = Cross(A, B, C), d4 = Cross(A, B, D);
+		return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+	}
+
 	// Lay out Nodes left-to-right anchored at (OriginX, OriginY). Returns component count.
 	static int32 LayeredLayout(const TArray<UEdGraphNode*>& Nodes, float OriginX, float OriginY)
 	{
@@ -9152,9 +9528,15 @@ namespace VibeUELayout
 			// predecessors), then everything else — so the dropped edge is the genuine
 			// loop-back rather than an arbitrary forward edge, and loop bodies still flow L->R.
 			TArray<UEdGraphNode*> SeedOrder;
+			// Primary events (BeginPlay/Tick/input/overrides) seed before custom events so
+			// the main event chain gets the earliest visit ranks (issue #354).
 			for (UEdGraphNode* SN : Nodes)
 			{
-				if (SN->IsA<UK2Node_Event>() || SN->IsA<UK2Node_CustomEvent>()) { SeedOrder.AddUnique(SN); }
+				if (SN->IsA<UK2Node_Event>() && !SN->IsA<UK2Node_CustomEvent>()) { SeedOrder.AddUnique(SN); }
+			}
+			for (UEdGraphNode* SN : Nodes)
+			{
+				if (SN->IsA<UK2Node_CustomEvent>()) { SeedOrder.AddUnique(SN); }
 			}
 			for (UEdGraphNode* SN : Nodes)
 			{
@@ -9244,6 +9626,39 @@ namespace VibeUELayout
 			}
 		}
 
+		// Pull pure (exec-less) nodes rightward toward their consumers (ALAP): longest-path
+		// layering from roots drops a getter that feeds a column-7 node into column 0,
+		// producing a wire that spans the whole graph (issue #427). Relax each pure node up
+		// to just left of its nearest consumer so data feeders sit adjacent to their users;
+		// pure chains ripple right over successive passes.
+		{
+			auto IsPure = [](const UEdGraphNode* N)
+			{
+				for (const UEdGraphPin* P : N->Pins)
+				{
+					if (P && P->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) { return false; }
+				}
+				return true;
+			};
+			bool bChanged = true;
+			for (int32 Guard = 0; bChanged && Guard <= Nodes.Num(); ++Guard)
+			{
+				bChanged = false;
+				for (UEdGraphNode* N : Nodes)
+				{
+					const TArray<UEdGraphNode*>* S = LayerSucc.Find(N);
+					if (!S || S->Num() == 0 || !IsPure(N)) { continue; }
+					int32 MinSucc = MAX_int32;
+					for (UEdGraphNode* T : *S) { MinSucc = FMath::Min(MinSucc, Layer[T]); }
+					if (MinSucc != MAX_int32 && MinSucc - 1 > Layer[N])
+					{
+						Layer[N] = MinSucc - 1;
+						bChanged = true;
+					}
+				}
+			}
+		}
+
 		// Components via undirected flood fill (for vertical band separation).
 		TMap<UEdGraphNode*, int32> Comp;
 		int32 NumComp = 0;
@@ -9274,18 +9689,27 @@ namespace VibeUELayout
 			}
 		}
 
-		// Rank components: those containing events first, then larger ones (keeps the
-		// main event/function chain at the top).
+		// Rank components: those containing primary events (BeginPlay/Tick/input — real
+		// entry points) first, then any-event components, then larger ones. A timer
+		// callback Custom Event lives in its own component (the timer links by function
+		// name, not a wire), and without the primary-event key a large callback body
+		// out-ranked the small BeginPlay chain and was drawn above it (issue #354).
 		TArray<int32> CompNodeCount;
 		TArray<int32> CompEventCount;
+		TArray<int32> CompPrimaryEventCount;
 		CompNodeCount.Init(0, NumComp);
 		CompEventCount.Init(0, NumComp);
+		CompPrimaryEventCount.Init(0, NumComp);
 		for (const TPair<UEdGraphNode*, int32>& Pair : Comp)
 		{
 			CompNodeCount[Pair.Value]++;
 			if (Pair.Key->IsA<UK2Node_Event>() || Pair.Key->IsA<UK2Node_CustomEvent>())
 			{
 				CompEventCount[Pair.Value]++;
+				if (!Pair.Key->IsA<UK2Node_CustomEvent>())
+				{
+					CompPrimaryEventCount[Pair.Value]++;
+				}
 			}
 		}
 		TArray<int32> CompOrder;
@@ -9295,6 +9719,7 @@ namespace VibeUELayout
 		}
 		CompOrder.Sort([&](int32 A, int32 B)
 		{
+			if (CompPrimaryEventCount[A] != CompPrimaryEventCount[B]) return CompPrimaryEventCount[A] > CompPrimaryEventCount[B];
 			if (CompEventCount[A] != CompEventCount[B]) return CompEventCount[A] > CompEventCount[B];
 			return CompNodeCount[A] > CompNodeCount[B];
 		});
@@ -9394,9 +9819,32 @@ namespace VibeUELayout
 		// median center of its connected neighbors (priority method) so chains and the
 		// exec backbone stay horizontal instead of sloping. Independent components are
 		// placed in stacked, non-overlapping bands.
-		const float ColumnWidth = 420.0f;
+		const float ColumnGap = 140.0f;      // clearance between a column's widest node and the next column
+		const float MinColumnWidth = 280.0f; // floor so sparse columns don't collapse
 		const float RowGap = 56.0f;
 		const float ComponentGap = 160.0f;
+
+		// Column X by cumulative measured widths (widest node per layer, across all bands so
+		// bands stay column-aligned) instead of a fixed 420 px stride: skinny getter columns
+		// pack tight, wide SpawnActor/Timeline columns get the room they render at (issue #427).
+		TMap<int32, float> LayerMaxW;
+		for (UEdGraphNode* N : Nodes)
+		{
+			float& W = LayerMaxW.FindOrAdd(Layer[N], MinColumnWidth);
+			W = FMath::Max(W, EstimateNodeWidth(N));
+		}
+		TMap<int32, float> LayerX;
+		{
+			TArray<int32> AllLayers;
+			LayerMaxW.GetKeys(AllLayers);
+			AllLayers.Sort();
+			float X = OriginX;
+			for (int32 LK : AllLayers)
+			{
+				LayerX.Add(LK, X);
+				X += LayerMaxW[LK] + ColumnGap;
+			}
+		}
 
 		TArray<int32> Ranks;
 		Grid.GetKeys(Ranks);
@@ -9486,7 +9934,7 @@ namespace VibeUELayout
 				for (UEdGraphNode* N : Layers[LK])
 				{
 					N->Modify();
-					N->NodePosX = (int32)(OriginX + (float)LK * ColumnWidth);
+					N->NodePosX = (int32)LayerX[LK];
 					N->NodePosY = (int32)(Y[N] + Shift);
 				}
 			}
@@ -9521,11 +9969,22 @@ bool UBlueprintService::AutoLayoutGraph(
 		return false;
 	}
 
-	// Lay out every node in the graph.
+	// Lay out every real node; comment boxes are decoration — exclude them from the
+	// layered layout, remember which nodes each one contained, and re-fit it around
+	// those members' new positions afterwards so clusters survive re-layout (issue #427).
 	TArray<UEdGraphNode*> LayoutNodes;
+	TArray<UEdGraphNode_Comment*> CommentNodes;
 	for (UEdGraphNode* Node : Graph->Nodes)
 	{
-		if (Node)
+		if (!Node)
+		{
+			continue;
+		}
+		if (UEdGraphNode_Comment* CommentNode = Cast<UEdGraphNode_Comment>(Node))
+		{
+			CommentNodes.Add(CommentNode);
+		}
+		else
 		{
 			LayoutNodes.Add(Node);
 		}
@@ -9536,12 +9995,49 @@ bool UBlueprintService::AutoLayoutGraph(
 		return true; // Nothing to layout
 	}
 
+	TMap<UEdGraphNode_Comment*, TArray<UEdGraphNode*>> CommentMembers;
+	for (UEdGraphNode_Comment* CommentNode : CommentNodes)
+	{
+		const float CX0 = (float)CommentNode->NodePosX;
+		const float CY0 = (float)CommentNode->NodePosY;
+		const float CX1 = CX0 + (float)CommentNode->NodeWidth;
+		const float CY1 = CY0 + (float)CommentNode->NodeHeight;
+		for (UEdGraphNode* N : LayoutNodes)
+		{
+			const float NCX = (float)N->NodePosX + VibeUELayout::EstimateNodeWidth(N) * 0.5f;
+			const float NCY = (float)N->NodePosY + VibeUELayout::EstimateNodeHeight(N) * 0.5f;
+			if (NCX >= CX0 && NCX <= CX1 && NCY >= CY0 && NCY <= CY1)
+			{
+				CommentMembers.FindOrAdd(CommentNode).Add(N);
+			}
+		}
+	}
+
 	FScopedTransaction Transaction(NSLOCTEXT("BlueprintService", "AutoLayout", "Auto-Layout Graph"));
 	const int32 NumChains = VibeUELayout::LayeredLayout(LayoutNodes, 100.0f, 100.0f);
+
+	for (const TPair<UEdGraphNode_Comment*, TArray<UEdGraphNode*>>& Pair : CommentMembers)
+	{
+		float MinX = FLT_MAX, MinY = FLT_MAX, MaxX = -FLT_MAX, MaxY = -FLT_MAX;
+		for (UEdGraphNode* N : Pair.Value)
+		{
+			MinX = FMath::Min(MinX, (float)N->NodePosX);
+			MinY = FMath::Min(MinY, (float)N->NodePosY);
+			MaxX = FMath::Max(MaxX, (float)N->NodePosX + VibeUELayout::EstimateNodeWidth(N));
+			MaxY = FMath::Max(MaxY, (float)N->NodePosY + VibeUELayout::EstimateNodeHeight(N));
+		}
+		UEdGraphNode_Comment* CommentNode = Pair.Key;
+		CommentNode->Modify();
+		CommentNode->NodePosX = (int32)(MinX - 32.0f);
+		CommentNode->NodePosY = (int32)(MinY - 56.0f);
+		CommentNode->NodeWidth = (int32)((MaxX - MinX) + 64.0f);
+		CommentNode->NodeHeight = (int32)((MaxY - MinY) + 96.0f);
+	}
+
 	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
 
-	UE_LOG(LogTemp, Log, TEXT("AutoLayoutGraph: Laid out %d nodes in %d components in %s::%s"),
-		LayoutNodes.Num(), NumChains, *BlueprintPath, *GraphName);
+	UE_LOG(LogTemp, Log, TEXT("AutoLayoutGraph: Laid out %d nodes in %d components (%d comment boxes re-fitted) in %s::%s"),
+		LayoutNodes.Num(), NumChains, CommentMembers.Num(), *BlueprintPath, *GraphName);
 
 	return true;
 }
@@ -9583,11 +10079,11 @@ bool UBlueprintService::AutoLayoutSelectedNodes(
 	// Build a lookup set from the requested GUIDs
 	TSet<FString> IdSet(NodeIds);
 
-	// Collect only the requested nodes
+	// Collect only the requested nodes (comment boxes are decoration — never layered)
 	TArray<UEdGraphNode*> LayoutNodes;
 	for (UEdGraphNode* Node : Graph->Nodes)
 	{
-		if (Node && IdSet.Contains(Node->NodeGuid.ToString()))
+		if (Node && !Node->IsA<UEdGraphNode_Comment>() && IdSet.Contains(Node->NodeGuid.ToString()))
 		{
 			LayoutNodes.Add(Node);
 		}
@@ -9614,6 +10110,252 @@ bool UBlueprintService::AutoLayoutSelectedNodes(
 
 	UE_LOG(LogTemp, Log, TEXT("AutoLayoutSelectedNodes: Laid out %d/%d requested nodes in %d components in %s::%s"),
 		LayoutNodes.Num(), NodeIds.Num(), NumChains, *BlueprintPath, *GraphName);
+
+	return true;
+}
+
+// ────────────────────────────────────────────────────────────────
+// AnalyzeGraphLayout
+// ────────────────────────────────────────────────────────────────
+
+bool UBlueprintService::AnalyzeGraphLayout(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	FString& OutReportJson,
+	FString& OutError)
+{
+	OutReportJson.Empty();
+
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		OutError = FString::Printf(TEXT("Failed to load blueprint: %s"), *BlueprintPath);
+		return false;
+	}
+
+	UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName);
+	if (!Graph)
+	{
+		Graph = FindGraph(Blueprint, GraphName);
+	}
+	if (!Graph)
+	{
+		OutError = FString::Printf(TEXT("Graph '%s' not found"), *GraphName);
+		return false;
+	}
+
+	// Real nodes only — comment boxes are decoration, not graph structure.
+	TArray<UEdGraphNode*> GNodes;
+	for (UEdGraphNode* N : Graph->Nodes)
+	{
+		if (N && !N->IsA<UEdGraphNode_Comment>())
+		{
+			GNodes.Add(N);
+		}
+	}
+
+	struct FNodeBox { float X, Y, W, H; };
+	TMap<UEdGraphNode*, FNodeBox> Boxes;
+	for (UEdGraphNode* N : GNodes)
+	{
+		Boxes.Add(N, { (float)N->NodePosX, (float)N->NodePosY,
+			VibeUELayout::EstimateNodeWidth(N), VibeUELayout::EstimateNodeHeight(N) });
+	}
+
+	// Wires: one entry per link, walked from output pins only (no double counting).
+	// Endpoints use the same estimated geometry model as the layout itself.
+	struct FWire { UEdGraphNode* From; UEdGraphNode* To; FVector2D A; FVector2D B; bool bExec; };
+	TArray<FWire> Wires;
+	for (UEdGraphNode* N : GNodes)
+	{
+		for (UEdGraphPin* P : N->Pins)
+		{
+			if (!P || P->Direction != EGPD_Output)
+			{
+				continue;
+			}
+			for (UEdGraphPin* L : P->LinkedTo)
+			{
+				UEdGraphNode* T = L ? L->GetOwningNode() : nullptr;
+				if (!T || T == N || !Boxes.Contains(T))
+				{
+					continue;
+				}
+				const FNodeBox& SB = Boxes[N];
+				const FNodeBox& TB = Boxes[T];
+				FWire W;
+				W.From = N;
+				W.To = T;
+				W.A = FVector2D(SB.X + SB.W, SB.Y + VibeUELayout::PinRowCenterY(N, P));
+				W.B = FVector2D(TB.X, TB.Y + VibeUELayout::PinRowCenterY(T, L));
+				W.bExec = (P->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec);
+				Wires.Add(W);
+			}
+		}
+	}
+
+	auto NodeLabel = [](const UEdGraphNode* N)
+	{
+		return N->GetNodeTitle(ENodeTitleType::ListView).ToString();
+	};
+
+	// Node overlaps (boxes shrunk 2 px so mere edge-touching doesn't count).
+	int32 OverlapCount = 0;
+	TArray<TSharedPtr<FJsonValue>> OverlapList;
+	for (int32 i = 0; i < GNodes.Num(); ++i)
+	{
+		const FNodeBox& A = Boxes[GNodes[i]];
+		for (int32 j = i + 1; j < GNodes.Num(); ++j)
+		{
+			const FNodeBox& B = Boxes[GNodes[j]];
+			const bool bOverlap =
+				A.X + 2.0f < B.X + B.W - 2.0f && B.X + 2.0f < A.X + A.W - 2.0f &&
+				A.Y + 2.0f < B.Y + B.H - 2.0f && B.Y + 2.0f < A.Y + A.H - 2.0f;
+			if (bOverlap)
+			{
+				++OverlapCount;
+				if (OverlapList.Num() < 50)
+				{
+					OverlapList.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("%s <-> %s"),
+						*NodeLabel(GNodes[i]), *NodeLabel(GNodes[j]))));
+				}
+			}
+		}
+	}
+
+	// Wire crossings — straight-line approximation; wires sharing a node are excluded
+	// (fan-out from one pin always "touches" at the source and is not a readability defect).
+	int32 Crossings = 0;
+	for (int32 i = 0; i < Wires.Num(); ++i)
+	{
+		for (int32 j = i + 1; j < Wires.Num(); ++j)
+		{
+			const FWire& W1 = Wires[i];
+			const FWire& W2 = Wires[j];
+			if (W1.From == W2.From || W1.From == W2.To || W1.To == W2.From || W1.To == W2.To)
+			{
+				continue;
+			}
+			if (VibeUELayout::SegmentsIntersect(W1.A, W1.B, W2.A, W2.B))
+			{
+				++Crossings;
+			}
+		}
+	}
+
+	// Backward wires, lengths, exec straightness.
+	int32 ExecWireCount = 0;
+	int32 BackwardExec = 0;
+	TArray<TSharedPtr<FJsonValue>> BackwardList;
+	TArray<TSharedPtr<FJsonValue>> LongWireList;
+	double TotalLen = 0.0;
+	double ExecAbsDy = 0.0;
+	int32 LongWires = 0;
+	for (const FWire& W : Wires)
+	{
+		const double Len = FVector2D::Distance(W.A, W.B);
+		TotalLen += Len;
+		if (Len > 1500.0)
+		{
+			++LongWires;
+			if (LongWireList.Num() < 50)
+			{
+				LongWireList.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("%s -> %s (%d px)"),
+					*NodeLabel(W.From), *NodeLabel(W.To), (int32)Len)));
+			}
+		}
+		if (W.bExec)
+		{
+			++ExecWireCount;
+			ExecAbsDy += FMath::Abs(W.B.Y - W.A.Y);
+			if (W.B.X < W.A.X)
+			{
+				++BackwardExec;
+				if (BackwardList.Num() < 50)
+				{
+					BackwardList.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("%s -> %s"),
+						*NodeLabel(W.From), *NodeLabel(W.To))));
+				}
+			}
+		}
+	}
+
+	// Graph bounds.
+	float MinX = 0.0f, MinY = 0.0f, MaxX = 0.0f, MaxY = 0.0f;
+	bool bFirst = true;
+	for (const TPair<UEdGraphNode*, FNodeBox>& Pair : Boxes)
+	{
+		const FNodeBox& B = Pair.Value;
+		MinX = bFirst ? B.X : FMath::Min(MinX, B.X);
+		MinY = bFirst ? B.Y : FMath::Min(MinY, B.Y);
+		MaxX = bFirst ? B.X + B.W : FMath::Max(MaxX, B.X + B.W);
+		MaxY = bFirst ? B.Y + B.H : FMath::Max(MaxY, B.Y + B.H);
+		bFirst = false;
+	}
+
+	// Human/agent-readable issue summary — empty array means the layout looks clean.
+	TArray<TSharedPtr<FJsonValue>> Issues;
+	if (OverlapCount > 0)
+	{
+		Issues.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("%d overlapping node pair(s)"), OverlapCount)));
+	}
+	if (BackwardExec > 0)
+	{
+		Issues.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("%d backward exec wire(s) — execution flows right-to-left somewhere"), BackwardExec)));
+	}
+	if (Wires.Num() > 0 && Crossings > Wires.Num())
+	{
+		Issues.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("wire crossings (%d) exceed wire count (%d) — graph is hard to trace"), Crossings, Wires.Num())));
+	}
+	if (LongWires > 0)
+	{
+		Issues.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("%d wire(s) longer than 1500 px — consider moving producers next to consumers"), LongWires)));
+	}
+
+	// Per-node bounding boxes for model auditing.
+	TArray<TSharedPtr<FJsonValue>> NodeArr;
+	for (UEdGraphNode* N : GNodes)
+	{
+		const FNodeBox& B = Boxes[N];
+		TSharedPtr<FJsonObject> NObj = MakeShared<FJsonObject>();
+		NObj->SetStringField(TEXT("id"), N->NodeGuid.ToString());
+		NObj->SetStringField(TEXT("title"), NodeLabel(N));
+		NObj->SetNumberField(TEXT("x"), B.X);
+		NObj->SetNumberField(TEXT("y"), B.Y);
+		NObj->SetNumberField(TEXT("width"), B.W);
+		NObj->SetNumberField(TEXT("height"), B.H);
+		NodeArr.Add(MakeShared<FJsonValueObject>(NObj));
+	}
+
+	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetNumberField(TEXT("nodeCount"), GNodes.Num());
+	Root->SetNumberField(TEXT("wireCount"), Wires.Num());
+	Root->SetNumberField(TEXT("execWireCount"), ExecWireCount);
+	Root->SetNumberField(TEXT("nodeOverlaps"), OverlapCount);
+	Root->SetArrayField(TEXT("overlappingPairs"), OverlapList);
+	Root->SetNumberField(TEXT("wireCrossings"), Crossings);
+	Root->SetNumberField(TEXT("backwardExecWires"), BackwardExec);
+	Root->SetArrayField(TEXT("backwardExecWireList"), BackwardList);
+	Root->SetNumberField(TEXT("longWires"), LongWires);
+	Root->SetArrayField(TEXT("longWireList"), LongWireList);
+	Root->SetNumberField(TEXT("totalWireLength"), FMath::RoundToDouble(TotalLen));
+	Root->SetNumberField(TEXT("avgWireLength"), Wires.Num() > 0 ? FMath::RoundToDouble(TotalLen / Wires.Num()) : 0.0);
+	Root->SetNumberField(TEXT("execWireMeanAbsDeltaY"), ExecWireCount > 0 ? FMath::RoundToDouble(ExecAbsDy / ExecWireCount) : 0.0);
+	{
+		TSharedPtr<FJsonObject> BoundsObj = MakeShared<FJsonObject>();
+		BoundsObj->SetNumberField(TEXT("minX"), MinX);
+		BoundsObj->SetNumberField(TEXT("minY"), MinY);
+		BoundsObj->SetNumberField(TEXT("maxX"), MaxX);
+		BoundsObj->SetNumberField(TEXT("maxY"), MaxY);
+		Root->SetObjectField(TEXT("bounds"), BoundsObj);
+	}
+	Root->SetArrayField(TEXT("issues"), Issues);
+	Root->SetArrayField(TEXT("nodes"), NodeArr);
+	Root->SetStringField(TEXT("note"), TEXT("Sizes are estimated widget dimensions (same model auto-layout uses); crossings use straight-line wire approximation."));
+
+	const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+		TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&OutReportJson);
+	FJsonSerializer::Serialize(Root.ToSharedRef(), Writer);
 
 	return true;
 }

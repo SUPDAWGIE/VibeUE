@@ -218,9 +218,17 @@ unreal.EditorAssetLibrary.rename_asset(
 
 ### Creating Widget Blueprints
 
-`unreal.BlueprintService.create_blueprint(name, "UserWidget", path)` creates a proper
-`WidgetBlueprint` (it detects UserWidget-derived parents and uses the UMG factory). For designing
-the widget afterwards (hierarchy, slots, bindings), load the **umg-widgets** skill.
+Use the engine's `WidgetBlueprintFactory` — a plain `BlueprintFactory` with a UserWidget
+parent creates a regular Blueprint, not a `WidgetBlueprint` (the removed
+`BlueprintService.create_blueprint` used to pick the UMG factory automatically):
+
+```python
+factory = unreal.WidgetBlueprintFactory()
+factory.set_editor_property("ParentClass", unreal.UserWidget)
+wbp = unreal.AssetToolsHelpers.get_asset_tools().create_asset("WBP_Menu", "/Game/UI", None, factory)
+```
+
+For designing the widget afterwards (hierarchy, slots, bindings), load the **umg-widgets** skill.
 
 ---
 
@@ -305,6 +313,11 @@ else:
     for ref in refs:          # ref is a package name, e.g. "/Game/Blueprints/BP_Player"
         print(f"In use by: {ref}")
 ```
+
+> ⚠️ **Deleting levels:** `delete_asset` on a recently-loaded `.umap` can return `True` (asset gone
+> from the registry) yet **leave the package file on disk**, so `delete_directory` on its folder then
+> fails. After deleting level assets, verify the `Content/...` folder on disk and remove leftover
+> `.umap` files manually.
 
 ### Import / Export Textures (VibeUE — crash-safe)
 

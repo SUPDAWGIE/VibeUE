@@ -58,6 +58,45 @@ struct FBlueprintGraphInfo
 };
 
 /**
+ * Fixed-size overview of a single graph — the cheap first read before deciding
+ * whether a full get_nodes_in_graph dump is needed. Payload size is independent
+ * of graph size (the histogram/entry lists are one line per distinct type/event,
+ * not per node).
+ */
+USTRUCT(BlueprintType)
+struct FBlueprintGraphSummary
+{
+	GENERATED_BODY()
+
+	/** Tab name as shown in the My Blueprint panel */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	FString GraphName;
+
+	/** "Ubergraph" | "Function" | "Macro" | "DelegateSignature" */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	FString GraphKind;
+
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	int32 NodeCount = 0;
+
+	/** Number of pin-to-pin links in the graph */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	int32 ConnectionCount = 0;
+
+	/** Blueprint-level compile status: UpToDate | UpToDateWithWarnings | Dirty | Error | Unknown */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	FString CompileStatus;
+
+	/** Titles of entry-point nodes (events, custom events, function entry) with their node ids: "Title|NodeId" */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	TArray<FString> EntryPoints;
+
+	/** Node class histogram, most frequent first: "K2Node_CallFunction x12" */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	TArray<FString> NodeTypeCounts;
+};
+
+/**
  * Detailed information about a blueprint variable (for get_info action)
  */
 USTRUCT(BlueprintType)
@@ -885,7 +924,12 @@ struct FGraphNodeDesc
 	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
 	FString Type;
 
-	/** Type-specific parameters (e.g. "class":"KismetMathLibrary", "function":"Clamp") */
+	/**
+	 * Type-specific parameters (e.g. "class":"KismetMathLibrary", "function":"Clamp").
+	 * Any node type also accepts an optional "group":"<title>" layout hint — after
+	 * BuildGraph's auto-layout phase, each distinct title becomes a comment box
+	 * wrapping its member nodes (GUID returned in RefToNodeId under "group:<title>").
+	 */
 	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
 	TMap<FString, FString> Params;
 };
@@ -1348,6 +1392,38 @@ public:
 	// ============================================================================
 
 	/**
+	 * Add a member variable to a blueprint, with full type-string support (struct, object,
+	 * enum, and container types — parsed by the same type parser as function local variables).
+	 *
+	 * This is the Epic-less delta of variable creation: the engine's BlueprintTools.add_variable
+	 * covers BASIC types only (bool/int/float/name/string/text/Vector/Rotator/Transform...).
+	 * Use this method when the variable's type is a struct, object, or enum — e.g. the
+	 * FStateTreeDelegateDispatcher member that bind_transition_to_delegate requires.
+	 *
+	 * @param BlueprintPath - Full path to the blueprint
+	 * @param VariableName - Name for the new variable (fails if it already exists)
+	 * @param VariableType - Type string, e.g. "float", "FVector", "FStateTreeDelegateDispatcher",
+	 *                       "AActor" (same format as add_function_local_variable)
+	 * @param DefaultValue - Optional default value as a string
+	 * @param bIsArray - Make it an array of VariableType
+	 * @param ContainerType - "", "Array", "Set", or "Map" (overrides bIsArray when set)
+	 * @return True if the variable was added
+	 *
+	 * Example:
+	 *   if not unreal.BlueprintService.variable_exists(bp_path, "FinishRotatingDispatcher"):
+	 *       unreal.BlueprintService.add_member_variable(bp_path, "FinishRotatingDispatcher", "FStateTreeDelegateDispatcher")
+	 *       unreal.BlueprintEditorLibrary.compile_blueprint(unreal.EditorAssetLibrary.load_asset(bp_path))
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints")
+	static bool AddMemberVariable(
+		const FString& BlueprintPath,
+		const FString& VariableName,
+		const FString& VariableType,
+		const FString& DefaultValue = TEXT(""),
+		bool bIsArray = false,
+		const FString& ContainerType = TEXT(""));
+
+	/**
 	 * Set the default value of an existing variable.
 	 *
 	 * @param BlueprintPath - Full path to the blueprint
@@ -1464,7 +1540,7 @@ public:
 	 * @param BlueprintPath - Full path to the blueprint
 	 * @param DispatcherName - Name of the event dispatcher
 	 * @param ParameterName - Name of the new parameter
-	 * @param ParameterType - Type string (same format as add_variable)
+	 * @param ParameterType - Type string (same type-string format as add_function_local_variable)
 	 * @param bIsArray - Whether the parameter is an array
 	 * @param ContainerType - Container type: "Array", "Set", "Map", or empty
 	 * @return True if successful
@@ -1546,7 +1622,7 @@ public:
 	 * @param BlueprintPath - Full path to the blueprint
 	 * @param FunctionName - Name of the function
 	 * @param ParameterName - Name of the parameter
-	 * @param ParameterType - Type string (same format as AddVariable)
+	 * @param ParameterType - Type string (same type-string format as add_function_local_variable)
 	 * @param bIsOutput - Whether this is an output parameter
 	 * @param bIsReference - Whether this is passed by reference
 	 * @param DefaultValue - Default value as a string (optional)
@@ -1577,7 +1653,7 @@ public:
 	 * @param BlueprintPath - Full path to the blueprint
 	 * @param FunctionName - Name of the function
 	 * @param VariableName - Name of the local variable
-	 * @param VariableType - Type string (same format as AddVariable)
+	 * @param VariableType - Type string (same type-string format as add_function_local_variable)
 	 * @param DefaultValue - Default value as a string (optional)
 	 * @param bIsArray - Whether this is an array type
 	 * @param ContainerType - Container type: "Array", "Set", "Map", or empty
@@ -1824,19 +1900,56 @@ public:
 	/**
 	 * Get all nodes in a graph.
 	 *
+	 * On large graphs the full dump is expensive — prefer get_graph_summary first,
+	 * then narrow this call with the optional filters.
+	 *
 	 * @param BlueprintPath - Full path to the blueprint
 	 * @param GraphName - Name of the graph
+	 * @param MaxNodes - Cap on returned nodes; 0 = unlimited (default)
+	 * @param NameFilter - Case-insensitive substring match against node title,
+	 *                     node type, or node id; empty = all nodes
+	 * @param bIncludePins - False drops the pins/pin_names arrays (the bulk of the
+	 *                       payload) leaving id/type/title/position per node
 	 * @return Array of node information
 	 *
 	 * Example:
 	 *   nodes = unreal.BlueprintService.get_nodes_in_graph("/Game/BP_Player", "ApplyDamage")
 	 *   for node in nodes:
 	 *       print(f"{node.node_title} at ({node.pos_x}, {node.pos_y})")
+	 *
+	 * Example - terse read of just the SpawnActor nodes, no pin data:
+	 *   nodes = unreal.BlueprintService.get_nodes_in_graph("/Game/BP_Player", "EventGraph", 25, "SpawnActor", False)
 	 */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints")
 	static TArray<FBlueprintNodeInfo> GetNodesInGraph(
 		const FString& BlueprintPath,
-		const FString& GraphName
+		const FString& GraphName,
+		int32 MaxNodes = 0,
+		const FString& NameFilter = TEXT(""),
+		bool bIncludePins = true
+	);
+
+	/**
+	 * Get a fixed-size overview of a graph: node/connection counts, blueprint
+	 * compile status, entry points, and a node-class histogram. Use this as the
+	 * default first read on any graph — its payload does not grow with graph
+	 * size, unlike get_nodes_in_graph.
+	 *
+	 * @param BlueprintPath - Full path to the blueprint
+	 * @param GraphName - Name of the graph
+	 * @param OutSummary - Filled with the summary on success
+	 * @return True if the blueprint and graph were found
+	 *
+	 * Example:
+	 *   s = unreal.BlueprintService.get_graph_summary("/Game/BP_Player", "EventGraph")
+	 *   if s[0]:
+	 *       print(s[1].node_count, s[1].compile_status, s[1].entry_points)
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints")
+	static bool GetGraphSummary(
+		const FString& BlueprintPath,
+		const FString& GraphName,
+		FBlueprintGraphSummary& OutSummary
 	);
 
 	/**
@@ -1922,6 +2035,38 @@ public:
 	);
 
 	/**
+	 * Create a component-bound event node (e.g. "On Clicked (MyButton)") — the same
+	 * node the Designer's green "+" next to an event creates. This is the ONLY
+	 * path that produces a runtime-live bound event: it initializes the delegate
+	 * binding params (including the auto-generated handler function name) that the
+	 * compiler needs to register the handler. Building the node manually via
+	 * create_node_by_key + configure_node compiles clean but never fires.
+	 *
+	 * If a bound event for this component+delegate already exists in the blueprint,
+	 * its node ID is returned instead of creating a duplicate.
+	 *
+	 * @param BlueprintPath - Full path to the blueprint (widget or actor)
+	 * @param GraphName - Name of the event graph (typically "EventGraph"; must be an ubergraph)
+	 * @param ComponentName - Variable name of the component (e.g. "MyButton")
+	 * @param DelegateName - Delegate property name on the component class (e.g. "OnClicked", "OnComponentBeginOverlap")
+	 * @param PosX - X position in the graph
+	 * @param PosY - Y position in the graph
+	 * @return Node ID (GUID) if successful, empty string otherwise
+	 *
+	 * Example:
+	 *   node_id = unreal.BlueprintService.create_component_bound_event("/Game/UI/WBP_Menu", "EventGraph", "MyButton", "OnClicked", 100, 100)
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints")
+	static FString CreateComponentBoundEvent(
+		const FString& BlueprintPath,
+		const FString& GraphName,
+		const FString& ComponentName,
+		const FString& DelegateName,
+		float PosX = 0.0f,
+		float PosY = 0.0f
+	);
+
+	/**
 	 * Add an input parameter (user-defined input pin) to an existing Custom Event node.
 	 * This is the equivalent of clicking "+ New Parameter" under Inputs in the Details panel
 	 * with a Custom Event node selected. The node is identified by its GUID (as returned by
@@ -1931,7 +2076,7 @@ public:
 	 * @param GraphName - Name of the graph containing the node (e.g. "EventGraph")
 	 * @param NodeId - GUID of the Custom Event node
 	 * @param ParameterName - Name of the new input pin
-	 * @param ParameterType - Type string (same format as add_variable, e.g. "float", "FRotator", "AActor")
+	 * @param ParameterType - Type string (same type-string format as add_function_local_variable, e.g. "float", "FRotator", "AActor")
 	 * @param bIsArray - Whether the parameter is an array
 	 * @param ContainerType - Container type: "Array", "Set", "Map", or empty
 	 * @return True if the pin was added
@@ -1980,7 +2125,7 @@ public:
 	 * @param NodeId - GUID of the Custom Event node
 	 * @param ParameterName - Current name of the input pin to modify
 	 * @param NewName - New name for the pin, or empty to keep the current name
-	 * @param NewType - New type string (same format as add_variable), or empty to keep the current type
+	 * @param NewType - New type string (same type-string format as add_function_local_variable), or empty to keep the current type
 	 * @param bIsArray - Whether the new type is an array (only used when NewType is provided)
 	 * @param ContainerType - Container type for the new type: "Array", "Set", "Map", or empty (only used when NewType is provided)
 	 * @return True if the pin was found and modified
@@ -2989,7 +3134,8 @@ public:
 	 *
 	 * Example:
 	 *   if not unreal.BlueprintService.blueprint_exists("/Game/Blueprints/BP_Enemy"):
-	 *       unreal.BlueprintService.create_blueprint("BP_Enemy", "Actor", "/Game/Blueprints")
+	 *       # Create engine-side: BlueprintFactory (set ParentClass) + AssetTools.create_asset.
+	 *       pass
 	 */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints|Exists")
 	static bool BlueprintExists(const FString& BlueprintPath);
@@ -3003,7 +3149,7 @@ public:
 	 *
 	 * Example:
 	 *   if not unreal.BlueprintService.variable_exists(bp_path, "Health"):
-	 *       unreal.BlueprintService.add_variable(bp_path, "Health", "float")
+	 *       unreal.BlueprintService.add_member_variable(bp_path, "Health", "float")
 	 */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints|Exists")
 	static bool VariableExists(const FString& BlueprintPath, const FString& VariableName);
@@ -3220,6 +3366,32 @@ public:
 		const FString& BlueprintPath,
 		const FString& GraphName,
 		const TArray<FString>& NodeIds,
+		FString& OutError
+	);
+
+	/**
+	 * Measure the visual quality of a graph's current layout WITHOUT changing it.
+	 * Returns a JSON report with: nodeCount, wireCount, execWireCount, nodeOverlaps
+	 * (+ overlappingPairs), wireCrossings, backwardExecWires (+ list), longWires,
+	 * total/avg wire length, execWireMeanAbsDeltaY (0 = perfectly straight exec
+	 * backbone), graph bounds, an "issues" summary array (empty = layout looks
+	 * clean), and per-node bounding boxes {id, title, x, y, width, height} so an
+	 * agent can audit and correct placement.
+	 *
+	 * Intended loop: build_graph(auto_layout=True) → analyze_graph_layout → if
+	 * "issues" is non-empty, fix (auto_layout_selected_nodes / set_node_position)
+	 * and re-check. Comment boxes are ignored (decoration, not structure).
+	 *
+	 * Python Usage (bool return is folded away — the two out-strings come back as a tuple):
+	 *   report, err = unreal.BlueprintService.analyze_graph_layout("/Game/BP_Player", "EventGraph")
+	 *   data = json.loads(report)
+	 *   assert data["nodeOverlaps"] == 0 and data["backwardExecWires"] == 0
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints|BatchGraph")
+	static bool AnalyzeGraphLayout(
+		const FString& BlueprintPath,
+		const FString& GraphName,
+		FString& OutReportJson,
 		FString& OutError
 	);
 

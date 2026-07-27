@@ -102,13 +102,37 @@ static bool ContainsDangerousPattern(const FString& Code, FString& OutPattern, F
 	{
 		// Inline: get_default_object(...).set_editor_property(...) on the same line.
 		// Uses [^\n]* to skip nested parens (e.g. get_default_object(bp.generated_class())).
+		//
+		// Matched PER LOGICAL LINE, and an ESCAPED "\n" counts as a separator.
+		//
+		// [^\n]* confines the match to one line only while the subject really contains newline
+		// CHARACTERS, and a large share of traffic does not: the repo's transport wraps every body
+		// as exec(compile(<repr of the code>, ...)), and repr() flattens a whole multi-line script
+		// onto ONE line whose newlines are the two characters backslash-n. Across such a body the
+		// class degenerates into "get_default_object anywhere, then set_editor_property anywhere" —
+		// exactly the too-broad Contains rejected above — and it refused every sanctioned CDO writer
+		// in the project (sup_set_class_defaults, sup_set_nested_property), each of which reads a
+		// CDO on one line and sets a property on another.
+		//
+		// Splitting on the escape as well restores the intended semantics for wrapped and plain
+		// payloads alike. Over-splitting is SAFE in one direction only: a match must fit inside a
+		// single segment, so a finer split can only ever drop a match, never invent one.
 		static FRegexPattern CdoModifyPattern(TEXT("get_default_object\\b[^\\n]*\\.\\s*set_editor_property"));
-		FRegexMatcher CdoModifyMatcher(CdoModifyPattern, Code);
-		if (CdoModifyMatcher.FindNext())
+		TArray<FString> CodeLines;
+		FString Unflattened = Code.Replace(TEXT("\\n"), TEXT("\n"), ESearchCase::CaseSensitive);
+		Unflattened.ParseIntoArrayLines(CodeLines, /*InCullEmpty=*/false);
+		for (const FString& CodeLine : CodeLines)
 		{
-			OutPattern = TEXT("get_default_object() modification");
-			OutReason = TEXT("Modifying Class Default Objects (CDOs) from Python causes crashes. Modify instances instead.");
-			return true;
+			FRegexMatcher CdoModifyMatcher(CdoModifyPattern, CodeLine);
+			if (CdoModifyMatcher.FindNext())
+			{
+				OutPattern = TEXT("get_default_object() modification");
+				OutReason = FString::Printf(
+					TEXT("Modifying Class Default Objects (CDOs) from Python causes crashes. Modify instances instead. ")
+					TEXT("[matched 1 of %d line(s), line length %d]"),
+					CodeLines.Num(), CodeLine.Len());
+				return true;
+			}
 		}
 	}
 	

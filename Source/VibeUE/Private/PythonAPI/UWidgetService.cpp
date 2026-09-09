@@ -167,6 +167,49 @@ namespace
 
 	TMap<FString, TWeakObjectPtr<UUserWidget>> GPIEWidgetInstances;
 
+	// A widget added outside the UMG designer still needs an entry in WidgetVariableNameToGuidMap, or the
+	// next compile trips FWidgetBlueprintCompilerContext::ValidateAndFixUpVariableGuids' ensure
+	// ("Widget [X] was added but did not get a GUID"). The compiler fills the map wholesale only while it is
+	// EMPTY, so seeding a single entry into an empty map would strand every OTHER widget on the validating
+	// branch - fill it the same deterministic way the compiler does before adding ours.
+	void WidgetServiceRegisterVariableGuid(UWidgetBlueprint* WidgetBP, const UWidget* NewWidget)
+	{
+		if (!WidgetBP || !NewWidget)
+		{
+			return;
+		}
+
+		WidgetBP->Modify();
+
+		if (WidgetBP->WidgetVariableNameToGuidMap.IsEmpty())
+		{
+			WidgetBP->ForEachSourceWidget([WidgetBP](UWidget* Existing)
+			{
+				if (Existing && !WidgetBP->WidgetVariableNameToGuidMap.Contains(Existing->GetFName()))
+				{
+					WidgetBP->WidgetVariableNameToGuidMap.Emplace(
+						Existing->GetFName(), FGuid::NewDeterministicGuid(Existing->GetPathName()));
+				}
+			});
+
+			for (const UWidgetAnimation* Animation : WidgetBP->Animations)
+			{
+				if (Animation && !WidgetBP->WidgetVariableNameToGuidMap.Contains(Animation->GetFName()))
+				{
+					WidgetBP->WidgetVariableNameToGuidMap.Emplace(
+						Animation->GetFName(), FGuid::NewDeterministicGuid(Animation->GetPathName()));
+				}
+			}
+		}
+
+		// The new widget's path is not yet stable across the compile that is about to run, so it gets a fresh
+		// GUID rather than a deterministic one - the same shape the compiler's own fix-up branch uses.
+		if (!WidgetBP->WidgetVariableNameToGuidMap.Contains(NewWidget->GetFName()))
+		{
+			WidgetBP->WidgetVariableNameToGuidMap.Emplace(NewWidget->GetFName(), FGuid::NewGuid());
+		}
+	}
+
 	FProperty* FindPropertyCaseInsensitive(UStruct* StructType, const FString& PropertyName)
 	{
 		if (!StructType)
@@ -1613,11 +1656,7 @@ FWidgetAddComponentResult UWidgetService::AddComponent(
 	NewWidget->bIsVariable = bIsVariable;
 
 	// Register widget with GUID map (required for UMG compilation)
-	const FName WidgetFName = NewWidget->GetFName();
-	if (!WidgetBP->WidgetVariableNameToGuidMap.Contains(WidgetFName))
-	{
-		WidgetBP->WidgetVariableNameToGuidMap.Add(WidgetFName, FGuid::NewGuid());
-	}
+	WidgetServiceRegisterVariableGuid(WidgetBP, NewWidget);
 
 	// Add to parent or set as root
 	if (ParentPanel)

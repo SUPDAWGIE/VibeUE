@@ -7891,7 +7891,14 @@ bool UBlueprintService::OverrideFunction(const FString& BlueprintPath, const FSt
 
 	if (!TargetFunc)
 	{
-		UE_LOG(LogTemp, Error, TEXT("OverrideFunction: '%s' not found in parent hierarchy of %s"), *FunctionName, *BlueprintPath);
+		TargetFunc = FBlueprintEditorUtils::FindFunctionInImplementedInterfaces(
+			Blueprint, FName(*FunctionName), nullptr, true);
+		FuncOwnerClass = TargetFunc ? TargetFunc->GetOwnerClass() : nullptr;
+	}
+
+	if (!TargetFunc)
+	{
+		UE_LOG(LogTemp, Error, TEXT("OverrideFunction: '%s' not found in parent hierarchy or implemented interfaces of %s"), *FunctionName, *BlueprintPath);
 		return false;
 	}
 
@@ -7901,8 +7908,20 @@ bool UBlueprintService::OverrideFunction(const FString& BlueprintPath, const FSt
 		return false;
 	}
 
-	const bool bHasReturnValue = (TargetFunc->GetReturnProperty() != nullptr);
-	if (!bHasReturnValue && TargetFunc->HasAnyFunctionFlags(FUNC_Event))
+	// Interface function graphs are stored separately from Blueprint->FunctionGraphs.
+	for (const FBPInterfaceDescription& Interface : Blueprint->ImplementedInterfaces)
+	{
+		for (UEdGraph* Graph : Interface.Graphs)
+		{
+			if (Graph && Graph->GetName().Equals(FunctionName, ESearchCase::IgnoreCase))
+			{
+				UE_LOG(LogTemp, Log, TEXT("OverrideFunction: Interface function '%s' already implemented in %s"), *FunctionName, *BlueprintPath);
+				return true;
+			}
+		}
+	}
+
+	if (UEdGraphSchema_K2::FunctionCanBePlacedAsEvent(TargetFunc))
 	{
 		UEdGraph* EventGraph = FindGraph(Blueprint, TEXT("EventGraph"));
 		if (!EventGraph && Blueprint->UbergraphPages.Num() > 0)
@@ -8615,12 +8634,22 @@ UEdGraphNode* UBlueprintService::CreateNodeFromDesc(
 		UFunction* EventFunction = Blueprint->ParentClass->FindFunctionByName(FName(**EventName));
 		if (!EventFunction)
 		{
-			OutError = FString::Printf(TEXT("Node '%s': Event '%s' not found in parent class '%s'"), *Desc.Ref, **EventName, *Blueprint->ParentClass->GetName());
+			EventFunction = FBlueprintEditorUtils::FindFunctionInImplementedInterfaces(
+				Blueprint, FName(**EventName), nullptr, true);
+		}
+		if (!EventFunction)
+		{
+			OutError = FString::Printf(TEXT("Node '%s': Event '%s' not found in parent hierarchy or implemented interfaces"), *Desc.Ref, **EventName);
+			return nullptr;
+		}
+		if (!UEdGraphSchema_K2::FunctionCanBePlacedAsEvent(EventFunction))
+		{
+			OutError = FString::Printf(TEXT("Node '%s': Function '%s' cannot be implemented as an event; use OverrideFunction for a function graph"), *Desc.Ref, **EventName);
 			return nullptr;
 		}
 
 		UK2Node_Event* EventNode = NewObject<UK2Node_Event>(Graph);
-		EventNode->EventReference.SetExternalMember(FName(**EventName), Blueprint->ParentClass);
+		EventNode->EventReference.SetExternalMember(EventFunction->GetFName(), EventFunction->GetOwnerClass());
 		EventNode->bOverrideFunction = true;
 		EventNode->NodePosX = PosX;
 		EventNode->NodePosY = PosY;
@@ -10603,11 +10632,20 @@ bool UBlueprintService::AddInterface(
 	// Resolve interface class - try multiple strategies
 	UClass* InterfaceClass = nullptr;
 
-	// Strategy 1: Try loading as a Blueprint asset path
-	UBlueprint* InterfaceBP = Cast<UBlueprint>(StaticLoadObject(UBlueprint::StaticClass(), nullptr, *InterfacePath));
-	if (InterfaceBP)
+	// Native interfaces are classes in script packages, without a Blueprint asset or _C suffix.
+	if (InterfacePath.StartsWith(TEXT("/Script/")))
 	{
-		InterfaceClass = InterfaceBP->GeneratedClass;
+		InterfaceClass = LoadClass<UObject>(nullptr, *InterfacePath);
+	}
+
+	// Strategy 1: Try loading as a Blueprint asset path
+	if (!InterfaceClass)
+	{
+		UBlueprint* InterfaceBP = Cast<UBlueprint>(StaticLoadObject(UBlueprint::StaticClass(), nullptr, *InterfacePath));
+		if (InterfaceBP)
+		{
+			InterfaceClass = InterfaceBP->GeneratedClass;
+		}
 	}
 
 	// Strategy 2: Try with _C suffix as a class path
@@ -10641,7 +10679,7 @@ bool UBlueprintService::AddInterface(
 
 	if (!InterfaceClass)
 	{
-		UE_LOG(LogTemp, Error, TEXT("AddInterface: Interface '%s' not found. Provide the full asset path (e.g., /Game/interface/BPI_TestInterface)"), *InterfacePath);
+		UE_LOG(LogTemp, Error, TEXT("AddInterface: Interface '%s' not found. Provide a Blueprint Interface asset path or native /Script/Module.InterfaceClass path."), *InterfacePath);
 		return false;
 	}
 
@@ -10651,7 +10689,7 @@ bool UBlueprintService::AddInterface(
 	// Reject it here instead.
 	if (!InterfaceClass->HasAnyClassFlags(CLASS_Interface))
 	{
-		UE_LOG(LogTemp, Error, TEXT("AddInterface: '%s' resolves to '%s', which is not a Blueprint Interface. Provide a Blueprint Interface asset."),
+		UE_LOG(LogTemp, Error, TEXT("AddInterface: '%s' resolves to '%s', which is not an interface. Provide a Blueprint Interface asset or native interface class."),
 			*InterfacePath, *InterfaceClass->GetName());
 		return false;
 	}

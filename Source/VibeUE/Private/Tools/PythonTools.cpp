@@ -11,6 +11,7 @@
 #include "UObject/Package.h"
 #include "UObject/UObjectIterator.h" // TObjectIterator<UWorld> for the resident-map check
 #include "Engine/World.h"
+#include "Engine/Level.h" // ULevel::OwningWorld for the resident-map check
 #include "FileHelpers.h" // FEditorFileUtils + UEditorLoadingAndSavingUtils (headless SavePackages)
 
 // Include service headers after PythonTypes
@@ -65,6 +66,15 @@ TArray<FString> UPythonTools::GetResidentMapWorlds()
 			continue;
 		}
 		if (!FPackageName::IsValidLongPackageName(Package->GetName()))
+		{
+			continue;
+		}
+		// A sublevel or Level Instance streamed into the open map is loaded on purpose and unloads
+		// with it; its level is owned by (and listed in) the editor world. Only a map loaded outside
+		// the open level can trip the next level load.
+		if (EditorWorld && World->PersistentLevel
+			&& (World->PersistentLevel->OwningWorld == EditorWorld
+				|| EditorWorld->GetLevels().Contains(World->PersistentLevel)))
 		{
 			continue;
 		}

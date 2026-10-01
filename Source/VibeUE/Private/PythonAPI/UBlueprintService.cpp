@@ -1079,10 +1079,11 @@ bool UBlueprintService::AddComponent(
 		
 		if (ParentNode)
 		{
+			// The parent is in this same SCS, so ChildNodes is the whole link. Do not call SetParent:
+			// it records ParentComponentOrVariableName, which is meant only for a parent inherited
+			// from another Blueprint. A same-SCS parent recorded there trips the FixupParentage
+			// ensure on load and failed the Android cook (exit 25, 2026-09-30).
 			ParentNode->AddChildNode(NewNode);
-			// CRITICAL: Call SetParent to properly set ParentComponentOrVariableName
-			// AddChildNode only manages the ChildNodes array, it does NOT set the parent reference
-			NewNode->SetParent(ParentNode);
 		}
 		else
 		{
@@ -1832,10 +1833,13 @@ bool UBlueprintService::ReparentComponent(
 	
 	// Add to new parent
 	NewParent->AddChildNode(NodeToReparent);
-	
-	// CRITICAL: Call SetParent to properly set ParentComponentOrVariableName
-	// AddChildNode only manages the ChildNodes array, it does NOT set the parent reference
-	NodeToReparent->SetParent(NewParent);
+
+	// NewParent is in this same SCS, so ChildNodes is the whole link. Clear any inherited-parent
+	// record the node carried instead of calling SetParent, which would record a same-SCS parent
+	// and trip the FixupParentage ensure on load (it failed the Android cook, 2026-09-30).
+	NodeToReparent->ParentComponentOrVariableName = NAME_None;
+	NodeToReparent->ParentComponentOwnerClassName = NAME_None;
+	NodeToReparent->bIsParentComponentNative = false;
 	
 	// Mark blueprint as modified
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);

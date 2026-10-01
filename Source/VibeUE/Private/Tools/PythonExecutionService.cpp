@@ -156,6 +156,26 @@ static bool ContainsDangerousPattern(const FString& Code, FString& OutPattern, F
 		return true;
 	}
 	
+	// The legacy MAP CHECK console command crashed the editor's Python interpreter for the whole
+	// editor process (UE 5.8, measured 2026-09-23); no Python-readable result exists anyway.
+	// Matched per logical line for the same reason as the CDO check above: the transport flattens a
+	// body onto one line whose newlines are an escaped backslash-n.
+	{
+		static FRegexPattern MapCheckPattern(TEXT("CONSOLE_COMMAND\\s*\\(.*[\"']\\s*MAP\\s+CHECK"));
+		TArray<FString> CodeLines;
+		Code.Replace(TEXT("\\n"), TEXT("\n"), ESearchCase::CaseSensitive).ToUpper().ParseIntoArrayLines(CodeLines, /*InCullEmpty=*/true);
+		for (const FString& CodeLine : CodeLines)
+		{
+			FRegexMatcher MapCheckMatcher(MapCheckPattern, CodeLine);
+			if (MapCheckMatcher.FindNext())
+			{
+				OutPattern = TEXT("MAP CHECK console command");
+				OutReason = TEXT("MAP CHECK through a console command crashes the editor's Python for the whole session. Use EditorValidatorSubsystem or a fresh map load instead.");
+				return true;
+			}
+		}
+	}
+
 	// Infinite loops
 	if (Code.Contains(TEXT("while True:")) && !Code.Contains(TEXT("break")))
 	{
@@ -304,18 +324,19 @@ TResult<FPythonExecutionResult> FPythonExecutionService::ExecuteCode(
 
 	double ExecutionTimeMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
 
-	// Check if execution took too long (post-execution check)
-	if (TimeoutMs > 0 && ExecutionTimeMs > TimeoutMs)
-	{
-		return TResult<FPythonExecutionResult>::Error(
-			ErrorCodes::PYTHON_EXECUTION_TIMEOUT,
-			FString::Printf(TEXT("Python execution exceeded %dms timeout (took %.2fms)"),
-				TimeoutMs, ExecutionTimeMs)
-		);
-	}
-
 	// Convert result
 	FPythonExecutionResult Result = ConvertExecutionResult(Command, ExecutionTimeMs);
+
+	// The timeout can only be measured after the script returns: by then it has run to completion
+	// and any saves it made are on disk. Report the overrun beside the real result instead of
+	// replacing it with an error, so the caller keeps the output that says what was written.
+	Result.TimeoutMs = TimeoutMs;
+	if (TimeoutMs > 0 && ExecutionTimeMs > TimeoutMs)
+	{
+		Result.bTimeoutExceeded = true;
+		UE_LOG(LogTemp, Warning, TEXT("Python execution exceeded %dms timeout (took %.2fms); it ran to completion and its result is returned"),
+			TimeoutMs, ExecutionTimeMs);
+	}
 
 	// Check for errors in result
 	if (!bSuccess || !Result.bSuccess)

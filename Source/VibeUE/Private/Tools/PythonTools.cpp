@@ -7,6 +7,7 @@
 #include "JsonUtilities.h"
 #include "Core/ErrorCodes.h"
 #include "FileHelpers.h" // FEditorFileUtils + UEditorLoadingAndSavingUtils (headless SavePackages)
+#include "Settings/VibeUEEditorSettings.h"
 
 // Include service headers after PythonTypes
 #include "Tools/PythonExecutionService.h"
@@ -181,8 +182,12 @@ FString UPythonTools::ExecutePythonCode(const FString& Code)
 		}
 	}
 
-	// Auto-save all dirty packages (headless) before executing Python code, unless the previous
-	// run crashed (dirty assets may be corrupt), GEditor is missing, or we're in PIE.
+	// Optionally auto-save all dirty packages (headless) before executing Python code, unless the
+	// previous run crashed (dirty assets may be corrupt), GEditor is missing, or we're in PIE.
+	// Off unless enabled in Editor Preferences > Plugins > VibeUE: with several tool sessions in one
+	// editor, a blanket save persists other sessions' unsaved work.
+	const UVibeUEEditorSettings* VibeSettings = GetDefault<UVibeUEEditorSettings>();
+	if (VibeSettings && VibeSettings->bAutoSaveDirtyPackagesBeforePython)
 	{
 		if (bLastPythonExecutionCrashed)
 		{
@@ -443,6 +448,11 @@ FString UPythonTools::ConvertExecutionResultToJson(const VibeUE::FPythonExecutio
 	}
 	
 	JsonObj->SetNumberField(TEXT("execution_time_ms"), Result.ExecutionTimeMs);
+	if (Result.bTimeoutExceeded)
+	{
+		JsonObj->SetBoolField(TEXT("timeout_exceeded"), true);
+		JsonObj->SetNumberField(TEXT("timeout_ms"), Result.TimeoutMs);
+	}
 
 	FString JsonString;
 	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonString);

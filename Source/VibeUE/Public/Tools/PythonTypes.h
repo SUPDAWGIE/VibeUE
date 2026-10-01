@@ -110,6 +110,12 @@ struct VIBEUE_API FPythonExecutionResult
 
 	/** Execution time in milliseconds */
 	float ExecutionTimeMs = 0.0f;
+
+	/** The script ran to completion but took longer than the requested timeout */
+	bool bTimeoutExceeded = false;
+
+	/** The timeout the run was measured against (0 = none) */
+	int32 TimeoutMs = 0;
 };
 
 /**

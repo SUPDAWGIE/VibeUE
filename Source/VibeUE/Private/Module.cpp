@@ -6,6 +6,7 @@
 #include "Editor.h"
 #include "Core/ToolRegistry.h"
 #include "HAL/IConsoleManager.h"
+#include "HAL/PlatformProcess.h"
 #include "HAL/PlatformFileManager.h"
 #include "HAL/FileManager.h"
 #include "Tools/PythonTools.h"
@@ -17,8 +18,16 @@
 #include "UObject/UObjectHash.h"
 #include "UObject/UObjectIterator.h"
 #include "Utils/VibeUEPaths.h"
+#include "Utils/VibeUEReadinessSignal.h"
+#include "Utils/VibeUEHealthSignal.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
+#include "PythonAPI/BehaviorTreeServiceInternal.h"
+#include "PythonAPI/UWorkflowService.h"
+#include "PythonAPI/UPIEActorService.h"
+#if WITH_VIBEUE_EQS
+#include "PythonAPI/EnvQueryServiceInternal.h"
+#endif
 
 #define LOCTEXT_NAMESPACE "FModule"
 
@@ -293,6 +302,25 @@ static FAutoConsoleCommandWithArgsAndOutputDevice GenerateAgentConfigCommand(
 	FConsoleCommandWithArgsAndOutputDeviceDelegate::CreateStatic(GenerateVibeUEAgentConfig)
 );
 
+// Re-scan Content/Skills and refresh the registered AgentSkill CDOs so skill edits are served
+// without an editor restart (issue #557). init_unreal.py upserts: existing classes get fresh
+// markdown, new packs register; deleted packs linger until the next launch.
+static FAutoConsoleCommand ReloadSkillsCommand(
+	TEXT("VibeUE.ReloadSkills"),
+	TEXT("Re-read Content/Skills markdown into the registered AgentSkills (no editor restart needed)."),
+	FConsoleCommandDelegate::CreateLambda([]()
+	{
+		IPythonScriptPlugin* Python = IPythonScriptPlugin::Get();
+		if (!Python || !Python->IsPythonAvailable())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("VibeUE.ReloadSkills: Python is not available."));
+			return;
+		}
+		const FString ScriptPath = FVibeUEPaths::GetPluginContentDir() / TEXT("Python") / TEXT("init_unreal.py");
+		Python->ExecPythonCommand(*ScriptPath);
+	})
+);
+
 void FModule::StartupModule()
 {
 	UE_LOG(LogTemp, Display, TEXT("VibeUE Module has started"));
@@ -306,6 +334,7 @@ void FModule::StartupModule()
 	}
 
 	bServicesInitialized = true;
+	UWorkflowService::InitializeJournal();
 
 	// Clear screenshots directory from previous sessions to save disk space
 	FVibeUEPaths::ClearScreenshotsDir();
@@ -363,6 +392,10 @@ static void GatherVibeUEToolsetClasses(TArray<UClass*>& OutClasses)
 
 void FModule::RegisterToolsets()
 {
+	// A reused process ID must not inherit a stale signal from an unclean Editor exit. This runs late
+	// in startup, so BuildAndLaunchGame also clears the file right after launch — see the script.
+	FVibeUEReadinessSignal::Remove();
+
 	// Service layer -> Epic's ToolsetRegistry (AICallable tools).
 	if (UToolsetRegistry::IsAvailable())
 	{
@@ -391,6 +424,26 @@ void FModule::RegisterToolsets()
 	{
 		OnRefreshToolsHandle = MCPModule->OnRefreshTools().AddRaw(this, &FModule::HandleMCPRefreshTools);
 	}
+
+	// Reaching the end of RegisterToolsets is the complete readiness contract.
+	FVibeUEReadinessSignal::Publish();
+
+	// Out-of-band liveness for agents: Epic's MCP endpoint runs on the game thread with no request
+	// timeout, so a wedged editor hangs clients for their full timeout. The heartbeat file lets an
+	// agent tell dead / wedged / healthy apart from the filesystem (issue #555).
+	FVibeUEHealthSignal::Start();
+
+#if WITH_EDITOR
+	// The signal's currentMap field must track map changes, not just the map loaded at startup —
+	// agents gate world edits on it after a relaunch (issue #554).
+	if (!OnMapOpenedHandle.IsValid())
+	{
+		OnMapOpenedHandle = FEditorDelegates::OnMapOpened.AddLambda([](const FString&, bool)
+		{
+			FVibeUEReadinessSignal::Publish();
+		});
+	}
+#endif
 }
 
 void FModule::HandleMCPRefreshTools()
@@ -403,6 +456,14 @@ void FModule::HandleMCPRefreshTools()
 
 void FModule::UnregisterToolsets()
 {
+#if WITH_EDITOR
+	if (OnMapOpenedHandle.IsValid())
+	{
+		FEditorDelegates::OnMapOpened.Remove(OnMapOpenedHandle);
+		OnMapOpenedHandle.Reset();
+	}
+#endif
+
 	if (OnRefreshToolsHandle.IsValid())
 	{
 		if (IModelContextProtocolModule* MCPModule = IModelContextProtocolModule::Get())
@@ -427,6 +488,22 @@ void FModule::UnregisterToolsets()
 
 void FModule::ShutdownModule()
 {
+	UWorkflowService::ShutdownJournal();
+	FVibeUEHealthSignal::Stop();
+	FVibeUEReadinessSignal::Remove();
+
+	// Unhook PIEActorService's EndPIE delegate. It is a raw static callback into this DLL, so it
+	// must not outlive the module (same reason as the helper caches below).
+	UPIEActorService::ShutdownEndPIEHook();
+
+	// Release the BT node-class helper cache while FModuleManager / the asset registry still
+	// exist — ~FGraphNodeClassHelper unhooks their delegates, which is UB at static teardown.
+	VibeBT::ShutdownClassHelperCache();
+#if WITH_VIBEUE_EQS
+	// Same reason, same lifetime: the EQS service keeps its own FGraphNodeClassHelper cache.
+	VibeEQS::ShutdownClassHelperCache();
+#endif
+
 	if (!bServicesInitialized)
 	{
 		UE_LOG(LogTemp, Display, TEXT("VibeUE Module has shut down"));
@@ -449,6 +526,9 @@ void FModule::ShutdownModule()
 void FModule::OnPreExit()
 {
 	UE_LOG(LogTemp, Display, TEXT("VibeUE OnPreExit - cleaning up Python services"));
+	UWorkflowService::ShutdownJournal();
+	FVibeUEHealthSignal::Stop();
+	FVibeUEReadinessSignal::Remove();
 	
 	// Release all C++ Python service instances
 	// This is safe because we're just clearing our own pointers

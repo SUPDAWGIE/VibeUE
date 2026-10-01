@@ -2,6 +2,7 @@
 name: materials
 display_name: Material System
 description: Create and edit materials and material instances — graph nodes, parameters, functions, custom HLSL, and instance overrides (MaterialService + MaterialNodeService). Use when the user asks to create or edit a material/material instance, wire material nodes, add material parameters, set blend/shading modes, or recreate a material graph. For landscape materials load landscape-materials.
+  Also use for generated organic PBR detail, texture seams, projection coordinates, and surface-normal diagnosis.
 vibeue_classes:
   - MaterialService
   - MaterialNodeService
@@ -19,6 +20,11 @@ keywords:
 > 🧠 **Brains complement:** IF an `unreal-engine-skills-manager` tool (external MCP) exists in this session, call it with `{action: "load", skill: "materials-and-shaders"}` for UE domain knowledge on this topic — correct APIs, architecture, best practices — and treat it as the rubric for any review / "best practices" question. If no such tool is available (e.g. running under Claude Code or Codex without that MCP), skip this line entirely and proceed with this skill alone — do NOT attempt the call.
 
 # Material System Skill
+
+For generated textures on large organic surfaces, seams after triplanar projection,
+or overly strong tissue relief, read [generated organic surfaces](references/generated-organic-surfaces.md).
+For gray/default surfaces after mesh reimport, use the asset-management skill's
+LOD-section mapping helper before changing the shader or buying new textures.
 
 ## Critical Rules
 
@@ -184,15 +190,28 @@ node_id = expr.id  # ← use .id, NOT expr itself
 
 ### ⚠️ Compile After Graph Changes
 
+Full graph workflow: **create nodes → connect nodes → connect to material output → compile → save.**
+
 ```python
-expr = unreal.MaterialNodeService.create_parameter(path, "Vector", "BaseColor", ...)
-# Engine: connect_to_output lives on MaterialTools; property is the MP_* name.
-call_tool(tool_name="connect_to_output",
-          toolset_name="editor_toolset.toolsets.material.MaterialTools",
-          arguments={"expression": expr.id, "output_name": "", "material_property": "MP_BaseColor"})  # use expr.id
-unreal.MaterialService.compile_material(path)  # REQUIRED
+mns = unreal.MaterialNodeService
+expr = mns.create_parameter(path, "Vector", "BaseColor", ...)
+
+# Wire an expression output straight into a material output (BaseColor, Normal, Roughness, ...).
+# output_name="" selects output 0; property accepts "BaseColor" or "MP_BaseColor" (case-insensitive).
+mns.connect_expression_to_output(path, expr.id, "", "BaseColor")   # returns True only after a read-back
+# ...and to clear it again:  mns.disconnect_output(path, "BaseColor")
+
+unreal.MaterialService.compile_material(path)  # REQUIRED after graph changes
 unreal.EditorAssetLibrary.save_asset(path)
 ```
+
+> ⚠️ **expr.id is session-specific** (`"<Class>_<pointer>"`) — it changes on editor restart. For a
+> durable reference use `expr.object_path`, which every id-based call (`connect_expression_to_output`,
+> `get_expression_details`, `set_expression_property`, ...) also accepts. Empty / bogus / foreign ids
+> are now rejected (they used to silently resolve to expression index 0).
+
+The engine's own `MaterialTools.connect_to_output` (`call_tool`, `material_property="MP_BaseColor"`) still
+works and is interchangeable — use whichever fits the surrounding code.
 
 ### ⚠️ Parameter Types
 
@@ -323,3 +342,13 @@ After non-trivial wiring run `MaterialNodeService.get_material_diagnostics(path)
 ## Related skills
 - **landscape-materials** — `LandscapeLayerBlend` nodes.
 - **landscape-auto-material** — production landscape materials (functions, RVT, instances).
+
+## Additional gotchas
+
+- `StaticMesh.get_editor_property("static_materials")` returns struct COPIES, so writing the array back is a silent no-op; use `set_material(index, mat)` and confirm with `get_material(index)`.
+- `MEL.set_material_instance_scalar_parameter_value` returns False on success, and the static-switch setter returns False while the write still lands — verify by readback; MI reads return 0.0 and writes no-op while PIE runs.
+- Changing `body_setup.collision_trace_flag` does not rebuild the physics mesh; toggle `StaticMeshEditorSubsystem.enable_section_collision` off then on.
+- Enumerate expressions with `ObjectIterator(unreal.MaterialExpression)` filtered on `path.startswith(mat_path + ":")` (class-specific iterators miss nodes); `delete_material_expression` enables in-place rebuilds that keep instance overrides when parameter names match.
+- Pin names: StaticSwitchParameter inputs are `True`/`False`; LandscapeLayerBlend inputs are `"Layer <name>"`/`"Height <name>"`; `LayerBlendInput` fields are invisible to `dir()` but `set_editor_property("layer_name"|"blend_type"|"preview_weight")` works.
+- Gate optional master-material features behind STATIC switches (a scalar "off" still samples); measure with `MEL.get_statistics`. A material used on a Niagara sprite renderer needs `bUsedWithNiagaraSprites`.
+- Delete a material with `AssetDiscoveryService.delete_asset_unattended`; it refuses (and returns a result struct naming the holder) when the material is still referenced or held by a Python global, instead of wedging on a modal dialog.

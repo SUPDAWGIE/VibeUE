@@ -26,6 +26,36 @@ unreal_classes:
 
 ## Critical Rules
 
+### ⚠️ `unreal.Rotator(a, b, c)` is `(roll, pitch, yaw)` — always pass by keyword
+
+Python's `FRotator` constructor takes **roll, pitch, yaw** (X, Y, Z), *not* the C++
+`FRotator(Pitch, Yaw, Roll)` order. Passing a yaw positionally lands it in **pitch**, and nothing
+warns you — the call succeeds and the actor is simply wrong:
+
+```python
+# WRONG - pitches the actor onto its nose; yaw stays 0
+actor.set_actor_rotation(unreal.Rotator(0.0, yaw, 0.0), False)
+
+# CORRECT
+actor.set_actor_rotation(unreal.Rotator(roll=0.0, pitch=0.0, yaw=yaw), False)
+```
+
+Observed failures from this exact mistake: a row of enemies rolled 180° and pitched instead of
+turned to face the player, a spawned sofa upside down, and a DirectionalLight aimed at the sky so
+every viewport capture came back black. It applies equally to
+`spawn_actor_from_class(cls, location, rotation)` and `spawn_actor_from_object`.
+
+**Verify, don't assume** — read it back (`r = actor.get_actor_rotation(); r.roll/r.pitch/r.yaw`) or
+check `get_actor_bounds`: a mesh that should sit on the floor and reports a negative Z range got
+flipped. A "look at this point" camera or actor rotation is:
+
+```python
+d = target - location
+rot = unreal.Rotator(roll=0.0,
+                     pitch=math.degrees(math.atan2(d.z, math.hypot(d.x, d.y))),
+                     yaw=math.degrees(math.atan2(d.y, d.x)))
+```
+
 ### � Creating a "Basic" Level Requires `new_level_from_template`, NOT `new_level`
 
 When the user asks to **create a new level** (especially "Basic", "Default", or with a sky/floor), **always** use `new_level_from_template`:
@@ -561,6 +591,29 @@ loc, rot, scale = unreal.ActorService.get_absolute_transform("MyCube")
 print(f"Absolute: loc={loc}, rot={rot}, scale={scale}")
 ```
 
+## Re-run a placed actor's construction script
+
+After changing a Blueprint component template or a placed actor's exposed variable, the placed
+actor's construction script does not re-execute on its own, so SCS-driven state goes stale. Python
+previously had no way to force it (the old nudge-by-0.01 trick). `ActorService.rerun_construction_scripts`
+now does it directly. Editor world only; it refuses (returns False, logs) while PIE is running.
+
+```python
+import unreal
+# Re-run the construction script for a placed Blueprint actor by label or name
+unreal.ActorService.rerun_construction_scripts("BP_Refrigerator_2")
+```
+
+To refresh the SCS viewport of an OPEN Blueprint editor (so it re-runs the construction script and
+redraws), use `unreal.BlueprintService.refresh_blueprint_editor("/Game/Props/BP_Refrigerator")` —
+it returns False when no editor is open for that Blueprint.
+
 ## Sample scripts (run via `execute_python_code`)
 
 - **`scripts/manipulate_actors.txt`** — list level actors, find by class, move/rotate by name.
+
+## Additional gotchas
+
+- World Partition: `save_current_level()` does not save external actor packages; `spawn_actor_from_object` writes to disk immediately with no dirty flag, but a later `set_actor_location` does not; after `load_level` WP actors read as unloaded stubs (not data loss); deleting a WP actor means `destroy_actor` plus saving the emptied package, or an orphan resurrects it.
+- An actor whose constructor creates no components has no root and is pinned to (0,0,0) forever (`RootComponent` reads None).
+- Editor-scripted volumes work — `spawn_actor_from_class(unreal.SomeVolume)` gives a 200 uu brush — but `encompasses_point` is not exposed.

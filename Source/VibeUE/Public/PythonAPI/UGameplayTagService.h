@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "GameplayTagContainer.h"
 #include "ToolsetRegistry/ToolsetDefinition.h"
 #include "UGameplayTagService.generated.h"
 
@@ -44,8 +45,8 @@ struct FVibeGameplayTagInfo
 };
 
 /**
- * Result of a gameplay tag operation (add, remove, rename).
- * Python access: result = unreal.GameplayTagService.add_tag("Cube.StartChasing")
+ * Result of a bulk gameplay tag add operation.
+ * Python access: result = unreal.GameplayTagService.add_tags(["Cube.StartChasing"])
  *
  * Properties:
  * - success (bool): Whether the operation succeeded
@@ -68,31 +69,15 @@ struct FGameplayTagResult
 };
 
 /**
- * Gameplay Tag Service - Python API for managing Unreal Engine Gameplay Tags.
+ * Gameplay Tag Service - Python API for querying and bulk-adding Gameplay Tags.
  *
- * Provides full CRUD operations for gameplay tags including:
- * - Listing and filtering tags
- * - Adding new tags (to INI config + runtime registration)
- * - Removing tags
- * - Renaming tags
- * - Querying tag hierarchy (children, parents)
+ * This service provides:
+ * - Bulk-adding new tags (to INI config + runtime registration)
+ * - Querying tag information and direct children
  * - Checking tag existence
  *
  * Python Usage:
  *   import unreal
- *
- *   # List all tags
- *   tags = unreal.GameplayTagService.list_tags()
- *   for t in tags:
- *       print(f"{t.tag_name} ({t.source})")
- *
- *   # List tags matching a prefix
- *   cube_tags = unreal.GameplayTagService.list_tags("Cube")
- *
- *   # Add a single tag
- *   result = unreal.GameplayTagService.add_tag("Cube.StartChasing", "Event to start chasing")
- *   if result.success:
- *       print("Tag added!")
  *
  *   # Add multiple tags at once
  *   result = unreal.GameplayTagService.add_tags(["Cube.StartChasing", "Cube.StopChasing"], "Chase events")
@@ -151,6 +136,40 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|GameplayTags")
 	static TArray<FVibeGameplayTagInfo> GetChildren(const FString& ParentTag);
+
+	/**
+	 * Look up a registered gameplay tag by name and return the real FGameplayTag VALUE.
+	 *
+	 * This is the editor-scripting escape hatch: Python cannot construct an FGameplayTag
+	 * (the struct's TagName is read-only and BlueprintGameplayTagLibrary::MakeLiteralGameplayTag
+	 * takes a tag, not a string), which blocks every tag-typed engine API — e.g.
+	 * SendGameplayEventToActor, HasMatchingGameplayTag, AssignTagSetByCallerMagnitude,
+	 * and TMap<FGameplayTag, ...> authoring.
+	 *
+	 * Python:
+	 *   tag = unreal.GameplayTagService.request_tag("Ability.Fire")
+	 *   asc.has_matching_gameplay_tag(tag)
+	 *
+	 * @param TagName - Full tag name (redirects from renamed tags are applied)
+	 * @return The registered tag, or an INVALID tag (is_valid() false) when the name is
+	 *         not registered — never asserts.
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|GameplayTags")
+	static FGameplayTag RequestTag(const FString& TagName);
+
+	/**
+	 * Look up several registered tags at once and return them as a container.
+	 * Unregistered names are skipped (see the log for which). Convenience for
+	 * container-typed APIs (tag queries, RemoveActiveEffectsWithGrantedTags, ...).
+	 *
+	 * Python:
+	 *   c = unreal.GameplayTagService.request_tag_container(["State.Stunned", "State.Rooted"])
+	 *
+	 * @param TagNames - Full tag names
+	 * @return Container holding every name that resolved to a registered tag
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|GameplayTags")
+	static FGameplayTagContainer RequestTagContainer(const TArray<FString>& TagNames);
 
 #if WITH_EDITOR
 	// =================================================================

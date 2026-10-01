@@ -8,29 +8,50 @@
 #include "UAssetDiscoveryService.generated.h"
 
 /**
- * Asset discovery service exposed directly to Python.
+ * Result of DeleteAssetUnattended.
  *
- * This service provides asset search and discovery functionality with native
- * Unreal Engine types, eliminating the need for JSON serialization/deserialization.
+ * The function used to return bool with OutReferencers/OutError out-params, and Python maps a
+ * false bool return to None, which dropped the referencers AND the reason on every refusal — the
+ * exact information the caller needs to recover. A struct return always survives to Python.
+ */
+USTRUCT(BlueprintType)
+struct FUnattendedDeleteResult
+{
+	GENERATED_BODY()
+
+	/** True only when the asset is gone. */
+	UPROPERTY(BlueprintReadWrite, Category = "Assets")
+	bool bSuccess = false;
+
+	/** Package paths / object names that referenced the asset (filled on refusal AND on a forced delete). */
+	UPROPERTY(BlueprintReadWrite, Category = "Assets")
+	TArray<FString> Referencers;
+
+	/** Human-readable reason when the delete did not happen; empty on success. */
+	UPROPERTY(BlueprintReadWrite, Category = "Assets")
+	FString ErrorMessage;
+};
+
+/**
+ * Asset import/export and Content Browser service exposed directly to Python.
+ *
+ * Asset search and general CRUD are provided by the engine's AssetTools toolset.
+ * This service owns crash-safe image import, texture export, Content Browser
+ * selection, and open-editor checks.
  *
  * Python Usage:
  *   import unreal
  *
- *   # Search for assets
- *   assets = unreal.AssetDiscoveryService.search_assets("BP_", "Blueprint")
- *   for asset in assets:
- *       print(asset.asset_name, asset.package_path)
+ *   # Import an image without pumping the task graph inside an MCP call
+ *   path, error = unreal.AssetDiscoveryService.import_asset(
+ *       "C:/Images/rocks.jpg", "/Game/UI/Textures", "T_Rocks")
  *
- *   # Get assets by type
- *   textures = unreal.AssetDiscoveryService.get_assets_by_type("Texture2D")
- *
- *   # Find specific asset (in Python the out-param becomes the return value: AssetData or None)
- *   asset_data = unreal.AssetDiscoveryService.find_asset_by_path("/Game/MyAsset")
+ *   # Inspect the current Content Browser selection
+ *   asset_data = unreal.AssetDiscoveryService.get_primary_content_browser_selection()
  *   if asset_data:
- *       print(f"Found: {asset_data.asset_name}")
+ *       print(asset_data.package_name)
  *
- * @note All methods are static and thread-safe
- * @note This replaces the JSON-based manage_asset MCP tool
+ * @note All methods are static.
  */
 UCLASS(BlueprintType)
 class VIBEUE_API UAssetDiscoveryService : public UToolsetDefinition
@@ -78,6 +99,78 @@ public:
 		const FString& SourceFilePath,
 		const FString& DestinationFolder,
 		const FString& AssetName,
+		FString& OutError);
+
+	/**
+	 * Reimport an existing asset through the same handler used by Content Browser Reimport.
+	 *
+	 * Supports both Interchange and legacy factory imports. When NewSourcePath is supplied,
+	 * the registered reimport handler is asked to retarget the asset before reimporting it.
+	 * The operation is automated and never opens a missing-file picker or notification.
+	 *
+	 * @param AssetPath         - Content path or object path of the asset to reimport
+	 * @param NewSourcePath     - Optional replacement source file; empty uses the stored source
+	 * @param OutSourceFileUsed - Receives the resolved source file selected for reimport
+	 * @param OutError          - Receives a human-readable error message on failure
+	 * @return True when Unreal's registered reimport handler completed successfully
+	 *
+	 * Python usage (Unreal maps a false bool plus out parameters to None):
+	 *   result = unreal.AssetDiscoveryService.reimport_asset(
+	 *       "/Game/Characters/SKM_Player", "D:/Source/SKM_Player.fbx")
+	 *   if result is not None:
+	 *       source_file, error = result
+	 */
+	/**
+	 * Delete an asset with NO dialog, for unattended agent sessions. The engine's
+	 * EditorAssetLibrary.delete_asset pops a modal "asset is referenced" dialog when anything
+	 * points at the asset, and an MCP-driven editor cannot answer it: the game thread stalls
+	 * until someone force-kills the process. This function never asks. With
+	 * bForceEvenIfReferenced it force-deletes and nulls every reference (the same thing the
+	 * dialog's Force Delete button does); without it, a referenced asset is refused and the
+	 * referencers are returned so the caller can decide.
+	 *
+	 * IMPLEMENTATION: the refusal DECISION is a strictly NON-MUTATING, conservative native-root check.
+	 * It clears the Blueprint action database (harmless; mirrors the engine's OnAssetsPreDelete handler),
+	 * collects garbage, then runs ObjectTools::GatherObjectReferencersForDeletion with default flags to
+	 * see who holds the asset — WITHOUT replacing any references first. It refuses ONLY when an external
+	 * referencer is a UGCObjectReferencer: a native GC root holding the asset directly, which in an
+	 * unattended session is a Python module-level global that created or loaded it. That is the one case
+	 * the engine's force delete cannot clear, so it would stall on the modal "is in use" dialog. Every
+	 * other in-memory referencer — on-disk asset references, the action database's transient node
+	 * spawners, transient editor helpers like AnimSequencerController — the engine's own force delete
+	 * clears without prompting, so those are left to it.
+	 *
+	 * The decision does NOT run ForceReplaceReferences: an earlier shape did, and on a refusal it left the
+	 * Blueprint's skeleton/generated classes with a null ClassGeneratedBy, crashing the caller's retry
+	 * ("UBlueprintGeneratedClass::GetAuthoritativeClass: ClassGeneratedBy is null"). So the check only
+	 * looks; it never mutates.
+	 *
+	 * On success the ACTUAL deletion is handed to the real ObjectTools::ForceDeleteObjects(bShowConfirmation
+	 * =false), exactly as the pre-A13 code did, so child-Blueprint reparenting, child-redirector/
+	 * generated-class removal and UUserDefinedStruct reinstancing keep full engine fidelity. Its own
+	 * internal "is in use" check cannot reach a dialog, because we already confirmed no native root holds
+	 * the asset. A read-only package is also refused before ForceDeleteObjects, preventing its remaining
+	 * read-only-package prompt. The function therefore preserves its unattended/no-modal contract.
+	 *
+	 * @param AssetPath              - Package path of the asset (/Game/Folder/Asset)
+	 * @param bForceEvenIfReferenced - True: delete anyway and clear references; false: refuse if referenced
+	 * @return FUnattendedDeleteResult: bSuccess, Referencers (filled on refusal AND on force), ErrorMessage
+	 *
+	 * Python usage (the result struct always comes back, so the reason survives a refusal):
+	 *   result = unreal.AssetDiscoveryService.delete_asset_unattended("/Game/Anim/AS_Temp", True)
+	 *   if not result.b_success:
+	 *       print(result.error_message, result.referencers)
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable, CPP_Default_bForceEvenIfReferenced = "false"), Category = "VibeUE|Assets")
+	static FUnattendedDeleteResult DeleteAssetUnattended(
+		const FString& AssetPath,
+		bool bForceEvenIfReferenced);
+
+	UFUNCTION(BlueprintCallable, meta = (AICallable, CPP_Default_NewSourcePath = ""), Category = "VibeUE|Assets")
+	static bool ReimportAsset(
+		const FString& AssetPath,
+		const FString& NewSourcePath,
+		FString& OutSourceFileUsed,
 		FString& OutError);
 
 	/**

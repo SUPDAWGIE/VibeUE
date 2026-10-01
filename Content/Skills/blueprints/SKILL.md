@@ -36,6 +36,39 @@ related_skills:
 
 ## Critical Rules
 
+### ⚠️ Components added with `add_component` are NOT on the CDO
+
+`add_component` creates a **SCS node template**, not an instance on the class default object. So the
+obvious way to configure it silently does nothing — `get_components_by_class` on the CDO returns an
+empty list and the loop body never runs:
+
+```python
+# WRONG - prints [], the mesh is never assigned, and nothing errors
+cdo = unreal.get_default_object(bp.generated_class())
+for c in cdo.get_components_by_class(unreal.SkeletalMeshComponent):
+    c.set_editor_property("skeletal_mesh_asset", mesh)
+
+# CORRECT - go through the service, which edits the SCS template
+BS.set_component_property(BP, "Windmill", "SkeletalMeshAsset", "/Game/X/SK_Windmill.SK_Windmill")
+BS.set_component_property(BP, "Windmill", "AnimationMode", "AnimationBlueprint")
+BS.set_component_property(BP, "Windmill", "AnimClass", "/Game/X/ABP_Windmill.ABP_Windmill_C")
+```
+
+Values are strings: an asset takes its **object path** (`/Game/X/SK.SK`), a class takes the
+`_C` path, an enum takes the entry name. Read back with `get_component_property` to confirm — it
+returns the resolved object, e.g.
+`/Script/Engine.SkeletalMesh'/Game/X/SK_Windmill.SK_Windmill'`. Components that come from the
+**parent C++ class** *are* on the CDO and can be set directly; only SCS-added ones need the service.
+
+### Level Blueprints: pass the MAP path
+
+Every `unreal.BlueprintService.*` function that takes a `blueprint_path` also accepts a **map/world
+path** (e.g. `/Game/Maps/MainMenu`) and resolves it to that level's **Level Blueprint** — inspect and
+edit level scripts exactly like normal Blueprints. Explicit subobject paths
+(`/Game/Maps/MyMap.MyMap:PersistentLevel.MyMap`) work too. Compile still goes through
+`unreal.BlueprintEditorLibrary.compile_blueprint(...)` on the returned/loaded level script, and the
+MAP asset is what you save afterwards (`unreal.EditorAssetLibrary.save_asset("/Game/Maps/MyMap")`).
+
 ### ⚠️ Engine `BlueprintTools` args are `{refPath}` objects, NOT strings
 
 Every UObject/UClass argument to the engine `BlueprintTools` toolset (`blueprint`, `asset_type`,
@@ -144,6 +177,21 @@ unreal.BlueprintEditorLibrary.compile_blueprint(unreal.EditorAssetLibrary.load_a
 Returns `False` (with the reason in the log) on a duplicate name or an unresolvable type string.
 Compile after adding — the variable is registered but the class is only rebuilt on compile.
 
+### Removing one variable — `remove_member_variable` (VibeUE delta)
+
+`unreal.BlueprintService.remove_member_variable(bp_path, name, force=False)` removes exactly one
+member variable. The engine alternative, `BlueprintEditorLibrary.remove_unused_variables`, sweeps
+**every** unreferenced variable — use this when you want to delete just one. It counts Get/Set
+references across all graphs first: with references present and `force=False` it refuses (returns
+`False`, logs the referencing graphs and node counts); with `force=True` it removes the variable
+and its referencing nodes. A component name (from the Simple Construction Script) is refused with a
+pointer to the component API. Verifies by readback and returns `True` only when the variable is gone.
+
+```python
+unreal.BlueprintService.remove_member_variable(bp_path, "UnusedScratch")        # refuses if referenced
+unreal.BlueprintService.remove_member_variable(bp_path, "OldHealth", True)       # force: nodes go too
+```
+
 ### ⚠️ Adding a function graph — engine `BlueprintTools.add_function_graph`
 
 Creating a function graph moved to the engine toolset (`create_function` / `add_function` on
@@ -223,6 +271,10 @@ Rules:
 - Property names are the **native C++ names**: `bReplicates`, `InitialLifeSpan`, `bCanBeDamaged` —
   the `b` prefix is NOT stripped here (a stripped name returns `None`).
 - Values read back as strings: compare `value == "True"`, not `value is True`.
+- On UE 5.3+, `set_property` maps the deprecated GameplayEffect CDO fields
+  `InheritableGameplayEffectTags` and `InheritableOwnedTagsContainer` to their Asset Tags and
+  Target Tags GameplayEffect Components. Writing only the legacy fields is otherwise erased by
+  `UGameplayEffect::PreSave`.
 
 ### ⚠️ Info Struct Fields (don't guess — these are the complete lists)
 
@@ -386,6 +438,28 @@ unreal.EditorAssetLibrary.save_asset(bp)
 - Both return `bool` (`True` on success). A `False` from `add_interface` means either the interface path could not be resolved, or it resolved to an asset that is **not a Blueprint Interface** (e.g. a normal Blueprint or one merely parented to `UInterface`) — check the log and pass a real Blueprint Interface asset path.
 - The interface must be a true Blueprint Interface (`BPTYPE_Interface`), created with `BlueprintInterfaceFactory`. `add_interface` validates this and returns `False` for non-interface classes rather than letting the compile fail.
 
+**Authoring the interface itself.** A Blueprint Interface is nothing but its function graphs, so an
+empty one contributes nothing when implemented. Use `create_function_graph()` to define it — it is
+the counterpart to `override_function()`, which can only override a function that already exists:
+
+```python
+BS = unreal.BlueprintService
+BS.create_function_graph(bpi_path, "Interact")                                  # void -> an event on implementers
+BS.create_function_graph(bpi_path, "GetDisplayName")                            # returns the graph name, "" on failure
+BS.add_function_parameter(bpi_path, "GetDisplayName", "Name", "string", True)   # is_output=True -> a return value
+
+BS.add_interface(bp_path, bpi_path)
+BS.override_function(bp_path, "Interact")   # void interface fn -> event node in the EventGraph
+```
+
+`create_function_graph()` also works on a normal Blueprint (pass `is_pure=True` for a pure function).
+It returns `""` and logs the reason for: an empty or non-identifier name, a name already used by any
+graph on the Blueprint, or a name that already exists on the parent hierarchy — that last case is
+`override_function()`'s job, and a shadowing graph would be a duplicate-function compile error.
+
+A return-valued interface function is materialised as a graph on the implementer and shows up in
+`list_graphs()` as `Interface (<InterfaceClass>)`.
+
 ---
 
 ## Task Index
@@ -411,3 +485,9 @@ After any edit: compile via the engine `BlueprintTools.compile_blueprint` toolse
 (`call_tool(tool_name="compile_blueprint", toolset_name="editor_toolset.toolsets.blueprint.BlueprintTools", arguments={"blueprint": path})`)
 and check the result's `success` / `num_errors`, then `unreal.EditorAssetLibrary.save_asset(path)`.
 Don't claim success until compile reports zero errors.
+
+## Additional gotchas
+
+- `SubobjectDataSubsystem` is an ENGINE subsystem (`get_engine_subsystem`); `get_object_for_blueprint` lives on `SubobjectDataBlueprintFunctionLibrary`; SCS templates are named `<Name>_GEN_VARIABLE`; a `SubobjectDataHandle` has no `is_valid()` — test `k2_find_subobject_data_from_handle(h) is not None`.
+- `set_collision_enabled(NO_COLLISION)` on a spawned actor's component does not survive save/reload; `set_collision_profile_name("NoCollision")` serialises, and `can_ever_affect_navigation=False` persists.
+- Engine collision profiles predate custom trace channels, so a channel with no explicit entry falls back to the ini default response (BLOCK); a scripted volume or primitive must set each custom channel's response explicitly.

@@ -36,8 +36,9 @@ unreal.BlueprintService.connect_nodes(bp_path, graph, val_get_id, "Cube", mesh_i
 unreal.BlueprintService.connect_nodes(bp_path, graph, mesh_id, "CubeMesh", next_id, "Target")
 ```
 
-The `class` param must be the generated class name (`BP_Cube_C`, not `BP_Cube`). It
-resolves via the same 3-step class fallback as the engine `BlueprintTools.create`.
+The `class` param accepts `"BP_Cube"`, `"BP_Cube_C"`, or a `/Game/...` asset path, and loads
+unloaded Blueprints (fixed in issue #552 — previously only an exact, already-loaded `_C` name
+worked; `cast` node specs got the same treatment).
 
 ### Setting a Member of Another Class / Component (`member_set` node)
 
@@ -226,8 +227,8 @@ unreal.BlueprintService.remove_timeline_track(bp, "RotateTimeline", "Offset")   
 unreal.BlueprintService.remove_timeline(bp, "RotateTimeline")                                 # deletes node + template
 
 for t in unreal.BlueprintService.get_timelines(bp):
-    print(t.parameter_name, "| tracks:", t.parameter_type, "|", t.default_value)
-    # parameter_type is "float:Name,vector:Name,color:Name,event:Name,..."; default_value has Length/LengthMode/AutoPlay/Loop/...
+    print(t.timeline_name, "| tracks:", t.track_count, "| len:", t.length, "| loop:", t.loop, "| auto_play:", t.auto_play)
+    # get_timelines returns FBlueprintTimelineInfo: timeline_name, track_count (all track types), length, loop, auto_play
 ```
 
 - Track names must be unique within a timeline (across all track types). Adding/removing/renaming a track or changing settings reconstructs the node, so re-read pins afterwards.

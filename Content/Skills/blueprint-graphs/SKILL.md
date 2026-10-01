@@ -35,6 +35,24 @@ related_skills:
 
 ## Critical Rules
 
+### ⚠️ Nothing works during Play-In-Editor — and it fails SILENTLY
+
+Every `BlueprintService` method resolves its target through `LoadBlueprint()`, which fails while PIE
+is running. You get no error. You get an **empty array**, **`False`**, or an **empty-string node id**
+— which reads exactly like "that node type doesn't exist" or "that spawner key is wrong". It is very
+easy to spend a long time debugging a correct call that was only ever blocked by PIE.
+
+```python
+les = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+if les.is_in_play_in_editor():
+    raise RuntimeError("Stop PIE first - BlueprintService returns empty results during play")
+```
+
+**Check this FIRST when any call returns nothing unexpectedly**, before doubting a spawner key, a
+search term, or a graph name. The tell: `unreal.EditorAssetLibrary.does_asset_exist(bp_path)` also
+returns `False` for an asset you know exists. Asset writes during PIE are unsafe anyway — stop PIE,
+then re-run.
+
 ### ⚠️ Method Name Gotchas
 
 | WRONG | CORRECT |
@@ -446,6 +464,30 @@ assert node_id, actor_get_location.spawner_key
 
 If a node-create call returns an empty ID, stop immediately. Re-read the graph, inspect the error output, and fix the lookup before creating anything else.
 
+#### Variable get/set keys: own variables, and the qualified form
+
+`SPAWN K2Node_VariableGet|<MenuName>` (and `...VariableSet`) binds a variable the Blueprint **owns** —
+one of its own variables, an inherited one, or an SCS component. A variable you just added with
+`add_member_variable()` works immediately; the action database has no spawner for it yet, so the
+service binds it as a self member directly. Menu names use the variable's *display* spelling, and a
+bool drops its `b` prefix: `bIsOpen` is `"Get Is Open"` (the raw `"Get bIsOpen"` is accepted too).
+
+A variable owned by an **unrelated** class is refused, because binding one silently produces a node
+that fails to compile with "uses an invalid target". When you deliberately want another class's
+property wired through the node's Target pin, qualify the key with its owning class:
+
+```python
+# Refused — ACharacter is not in this Actor Blueprint's hierarchy:
+unreal.BlueprintService.create_node_by_key(bp, "EventGraph", "SPAWN K2Node_VariableGet|Get Jump Max Count", 0, 0)   # -> ""
+
+# Deliberate cross-class read, wired through the Target pin:
+unreal.BlueprintService.create_node_by_key(
+    bp, "EventGraph", "SPAWN K2Node_VariableGet|Get Jump Max Count|Character", 0, 0)                                # -> node id
+```
+
+Format: `SPAWN <NodeClass>|<MenuName>|<OwnerClass>`. If the named class is one the Blueprint already
+derives from, the node is bound as a self member instead (no redundant Target pin).
+
 ### ⚠️ Standard Macro nodes (ForEachLoop, etc.) — do NOT use `create_node_by_key`
 
 Macro instances (`K2Node_MacroInstance`) have **no spawner key**, so `discover_nodes()` won't find them and `create_node_by_key()` **fails silently** (returns empty, no error). Use the dedicated method instead:
@@ -501,6 +543,19 @@ node = unreal.BlueprintService.create_node_by_key(bp, "EventGraph", key, 400, 20
 OWN functions (your custom functions, callable on self) plus the full parent hierarchy and library
 functions. The returned `spawner_key` (`"FUNC <Class>::<Func>"`) feeds straight into
 `create_node_by_key` — this is how you add a **self-call** node deterministically.
+
+> ⚠️ **Leave `category` empty unless you are echoing a category you saw in a result.** It is a
+> substring match against the node's *menu* category, which is `"Self Functions"`, `"Parent: Actor"`,
+> or the editor's own menu path — **not** a topic word. Passing something reasonable-looking like
+> `"Math"` silently filters out everything and returns zero results, which looks identical to "no
+> such node exists". Search first with `category=""`, then read `.category` off the hits.
+
+> ⚠️ **Search the exact display name, not a fragment.** Results fill in order (self → parents →
+> action database) and stop at `max_results`, so a short common fragment gets crowded out before the
+> node you want is reached. `discover_nodes(bp, "Sin", "", 500)` returns 500 rows and **none** of
+> them is `Sin (Radians)`; `discover_nodes(bp, "Sin (Radians)", "", 20)` finds it immediately as
+> `FUNC KismetMathLibrary::Sin`. If a search comes back without an obvious node, make the term
+> **more** specific rather than raising the cap.
 
 #### Full node coverage — every action-menu node, not just functions/events
 
@@ -678,7 +733,7 @@ After any graph edit, verify all three layers:
 
 1. **Connections**: call `get_connections()` and confirm the exact expected wiring.
 2. **Pins**: if a connection fails, call `get_node_pins()` and use the real pin names.
-3. **Compile**: inspect the engine `BlueprintTools.compile_blueprint` result's `success`, `num_errors`, and `errors`.
+3. **Compile**: inspect the compile result's `success`, `num_errors`, and `errors`. Either the engine `BlueprintTools.compile_blueprint`, or `unreal.BlueprintService.compile_blueprint(bp_path)` — the latter returns an `FBlueprintCompileResult` (`success`, `num_errors`, `num_warnings`, `errors`, `warnings`) directly from the service, so you can compile and read the error text without leaving `BlueprintService`.
 
 For any node you claim you created, also re-read the graph with `get_nodes_in_graph()` and confirm that node actually exists in the graph after the edit. A returned node ID from a create call is not enough.
 
@@ -690,11 +745,15 @@ For `Custom Event` timer callbacks, verify both of these before wiring:
 Also verify that the node type is the expected custom event form rather than `K2Node_CreateDelegate`.
 
 ```python
-# compile goes through the engine BlueprintTools toolset
+# compile via the engine BlueprintTools toolset ...
 result = call_tool(tool_name="compile_blueprint",
                    toolset_name="editor_toolset.toolsets.blueprint.BlueprintTools",
                    arguments={"blueprint": bp_path})
 assert result["success"], result.get("errors")
+
+# ... or straight from BlueprintService, which returns the compiler's error text:
+res = unreal.BlueprintService.compile_blueprint(bp_path)
+assert res.success, (res.num_errors, res.errors)
 
 nodes = unreal.BlueprintService.get_nodes_in_graph(bp_path, graph)
 for node in nodes:
@@ -748,3 +807,15 @@ This skill index contains the frontmatter, intro, and the **Critical Rules / got
 - **`function-classes.md`** — Quick reference for the common class names you pass to a `build_graph` `function_call` node / engine `create_node` (KismetMathLibrary, KismetSystemLibrary, KismetArrayLibrary, GameplayStatics, etc.).
 - **`array-operations.md`** — Array operations on wildcard pins: `Array_Random`, available array functions, `K2Node_GetArrayItem`, wildcard pin type propagation, common array mistakes.
 - **`build-graph.md`** — The batch `build_graph` API: when to use it, node types, connection format, examples (BeginPlay → PrintString, Branch with Math, StateTreeDelegate Broadcast), round-trip export/rebuild, auto-layout, Make Struct / Make Instanced Struct, error handling.
+
+## Additional gotchas
+
+- `discover_nodes` returns clean `FUNC <BP>_C::Fn` keys now (no `SKEL_` prefix to strip). BP custom events are callable cross-BP through such a key; BP functions cannot call custom events — `FUNC Self::<Event>` in a function graph returns "".
+- Read pin defaults from `get_node_pins` (it now reports non-string defaults too); `get_graph_definition`'s `defaults` array and a node's `default_object` are the cross-checks. Bool pins on VariableSet nodes work (the pin name is the variable name).
+- Variable GET/SET spawners are scoped to the owning Blueprint now, so their keys are unambiguous — you no longer disambiguate by `n.category` (`Variables|<OwningBlueprint>`).
+- `build_graph` that fails on one node spec leaves the OTHER nodes behind; inspect the graph and delete the strays before retrying.
+- An interface function spawns as a plain `K2Node_CallFunction` with an interface-typed self pin — feed self through a `Cast To <Interface>` node; some query functions spawn PURE (no exec pins).
+- Compile errors surface in `compile_blueprint`'s `res.error`, and `get_editor_property("status")` reads `BS_ERROR`; never save on `BS_ERROR`, and stop PIE before structural edits (service calls against a BP with live PIE instances fail silently or return None).
+- Script-baked BP-CDO `TArray<TSubclassOf<...>>` defaults can be LOST on editor reload — read them back after a restart to confirm they persisted (writing the CDO is allowed; the engine just drops these array defaults across a reload).
+- Editor-world edits issued immediately after `StopPIE` can silently no-op; let the editor settle (poll) before editing.
+- `list_graphs`/`get_graph_summary` returning empty or None in a long session is a stale-session artifact, not a per-asset fact — restart before diagnosing. `list_graphs` legitimately returns `[]` for Anim Blueprints (use `AnimGraphService.list_graphs`).

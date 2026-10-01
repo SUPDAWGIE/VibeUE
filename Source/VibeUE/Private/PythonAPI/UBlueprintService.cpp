@@ -4,6 +4,9 @@
 #include "PythonAPI/BlueprintTypeParser.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
+#include "Engine/Level.h"                // Level Blueprint resolution (LoadBlueprint on a map path)
+#include "Engine/LevelScriptBlueprint.h"
+#include "Engine/World.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "WidgetBlueprint.h"
@@ -15,6 +18,7 @@
 #include "Logging/TokenizedMessage.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
+#include "K2Node_Variable.h"            // Base of Get/Set nodes — reference counting for RemoveMemberVariable
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
 #include "K2Node_IfThenElse.h"
@@ -54,6 +58,7 @@
 #include "GameFramework/Character.h"
 #include "GameFramework/PlayerController.h"
 #include "UObject/Package.h"
+#include "UObject/UnrealType.h"
 #include "UObject/UObjectIterator.h"
 #include "Factories/BlueprintFactory.h"
 #include "WidgetBlueprintFactory.h"      // For creating WidgetBlueprints (UBlueprintFactory can't)
@@ -86,6 +91,188 @@
 
 namespace
 {
+	class FScopedVibePropertyValue
+	{
+	public:
+		explicit FScopedVibePropertyValue(FProperty* InProperty)
+			: Property(InProperty)
+			, Data(InProperty ? FMemory::Malloc(InProperty->GetSize(), InProperty->GetMinAlignment()) : nullptr)
+		{
+			if (Data)
+			{
+				Property->InitializeValue(Data);
+			}
+		}
+
+		~FScopedVibePropertyValue()
+		{
+			if (Data)
+			{
+				Property->DestroyValue(Data);
+				FMemory::Free(Data);
+			}
+		}
+
+		FScopedVibePropertyValue(const FScopedVibePropertyValue&) = delete;
+		FScopedVibePropertyValue& operator=(const FScopedVibePropertyValue&) = delete;
+
+		explicit operator bool() const { return Data != nullptr; }
+		void* GetData() const { return Data; }
+
+	private:
+		FProperty* Property = nullptr;
+		void* Data = nullptr;
+	};
+
+	/** Parse into default-initialized storage, then replace the destination as one value. ImportText
+	 * otherwise merges compound members into their existing storage, so an explicit empty array or
+	 * tag container can leave old entries behind. */
+	static bool ImportPropertyValueReplacing(
+		FProperty* Property,
+		void* Destination,
+		UObject* Owner,
+		const FString& Text)
+	{
+		FScopedVibePropertyValue ParsedValue(Property);
+		if (!ParsedValue || !Property->ImportText_Direct(*Text, ParsedValue.GetData(), Owner, PPF_None))
+		{
+			return false;
+		}
+
+		Property->CopyCompleteValue(Destination, ParsedValue.GetData());
+		return true;
+	}
+
+	/**
+	 * UE 5.3+ keeps the two legacy GameplayEffect tag containers as read-only compatibility
+	 * mirrors. UGameplayEffect::PreSave clears them and rebuilds them from GEComponents, so a
+	 * successful ImportText on the legacy property alone is discarded during SaveAsset.
+	 *
+	 * Keep BlueprintService independent of the optional GameplayAbilities plugin by using
+	 * reflection. When the target really is a GameplayEffect, mirror the requested legacy value
+	 * into the modern component that owns it before the asset is saved.
+	 */
+	static bool TrySetGameplayEffectTagCompatibilityProperty(
+		UObject* CDO,
+		const FString& PropertyName,
+		const FString& PropertyValue,
+		bool& bOutHandled,
+		FString& InOutExpectedValue)
+	{
+		bOutHandled = false;
+
+		const TCHAR* ComponentClassPath = nullptr;
+		const TCHAR* ComponentPropertyName = nullptr;
+		if (PropertyName == TEXT("InheritableGameplayEffectTags"))
+		{
+			ComponentClassPath = TEXT("/Script/GameplayAbilities.AssetTagsGameplayEffectComponent");
+			ComponentPropertyName = TEXT("InheritableAssetTags");
+		}
+		else if (PropertyName == TEXT("InheritableOwnedTagsContainer"))
+		{
+			ComponentClassPath = TEXT("/Script/GameplayAbilities.TargetTagsGameplayEffectComponent");
+			ComponentPropertyName = TEXT("InheritableGrantedTagsContainer");
+		}
+		else
+		{
+			return true;
+		}
+
+		bool bIsGameplayEffect = false;
+		for (UClass* Class = CDO ? CDO->GetClass() : nullptr; Class; Class = Class->GetSuperClass())
+		{
+			if (Class->GetPathName() == TEXT("/Script/GameplayAbilities.GameplayEffect"))
+			{
+				bIsGameplayEffect = true;
+				break;
+			}
+		}
+		if (!bIsGameplayEffect)
+		{
+			return true;
+		}
+		bOutHandled = true;
+
+		UClass* ComponentClass = LoadObject<UClass>(nullptr, ComponentClassPath);
+		FArrayProperty* ComponentsProperty = FindFProperty<FArrayProperty>(CDO->GetClass(), TEXT("GEComponents"));
+		FObjectPropertyBase* ComponentObjectProperty = ComponentsProperty
+			? CastField<FObjectPropertyBase>(ComponentsProperty->Inner)
+			: nullptr;
+		FProperty* ComponentValueProperty = ComponentClass
+			? ComponentClass->FindPropertyByName(ComponentPropertyName)
+			: nullptr;
+		if (!ComponentClass || !ComponentsProperty || !ComponentObjectProperty || !ComponentValueProperty)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("SetProperty: GameplayEffect compatibility mapping for '%s' is unavailable in this engine build"),
+				*PropertyName);
+			return false;
+		}
+
+		void* ComponentsAddress = ComponentsProperty->ContainerPtrToValuePtr<void>(CDO);
+		FScriptArrayHelper Components(ComponentsProperty, ComponentsAddress);
+		UObject* Component = nullptr;
+		int32 AddedComponentIndex = INDEX_NONE;
+		for (int32 Index = 0; Index < Components.Num(); ++Index)
+		{
+			UObject* Candidate = ComponentObjectProperty->GetObjectPropertyValue(Components.GetRawPtr(Index));
+			if (Candidate && Candidate->IsA(ComponentClass))
+			{
+				Component = Candidate;
+				break;
+			}
+		}
+
+		if (!Component)
+		{
+			CDO->Modify();
+			Component = NewObject<UObject>(
+				CDO,
+				ComponentClass,
+				NAME_None,
+				CDO->GetMaskedFlags(RF_PropagateToSubObjects) | RF_Transactional);
+			if (!Component)
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("SetProperty: Failed to create GameplayEffect component '%s' for '%s'"),
+					ComponentClassPath, *PropertyName);
+				return false;
+			}
+
+			AddedComponentIndex = Components.AddValue();
+			ComponentObjectProperty->SetObjectPropertyValue(Components.GetRawPtr(AddedComponentIndex), Component);
+			UE_LOG(LogTemp, Log,
+				TEXT("SetProperty: Added GameplayEffect component '%s' for legacy property '%s'"),
+				ComponentClassPath, *PropertyName);
+		}
+
+		Component->Modify();
+		void* ComponentValueAddress = ComponentValueProperty->ContainerPtrToValuePtr<void>(Component);
+		if (!ImportPropertyValueReplacing(
+			ComponentValueProperty, ComponentValueAddress, Component, PropertyValue))
+		{
+			if (AddedComponentIndex != INDEX_NONE)
+			{
+				Components.RemoveValues(AddedComponentIndex, 1);
+				Component->MarkAsGarbage();
+			}
+			UE_LOG(LogTemp, Error,
+				TEXT("SetProperty: Failed to parse '%s' for GameplayEffect component property '%s'"),
+				*PropertyValue, ComponentPropertyName);
+			return false;
+		}
+
+#if WITH_EDITOR
+		FPropertyChangedEvent ChangedEvent(ComponentValueProperty, EPropertyChangeType::ValueSet);
+		Component->PostEditChangeProperty(ChangedEvent);
+#endif
+		// The component recomputes CombinedTags from Added/Removed (and any parent), so this is the
+		// canonical value the legacy compatibility mirror must contain after save.
+		ComponentValueProperty->ExportTextItem_Direct(
+			InOutExpectedValue, ComponentValueAddress, nullptr, Component, PPF_None);
+		return true;
+	}
+
 	static UEdGraph* ResolveBlueprintGraph(UBlueprint* Blueprint, const FString& GraphName)
 	{
 		if (!Blueprint)
@@ -123,6 +310,14 @@ namespace
 		if (ClassName.IsEmpty())
 		{
 			return nullptr;
+		}
+
+		// discover_nodes historically emitted skeleton-class names (SKEL_<BP>_C) for Blueprint
+		// functions and variables; the skeleton class is transient and not resolvable here, but the
+		// persistent generated class is "<BP>_C". Strip the prefix so those older keys still resolve.
+		if (ClassName.StartsWith(TEXT("SKEL_"), ESearchCase::CaseSensitive))
+		{
+			return ResolveClassByName(ClassName.RightChop(5));
 		}
 
 		if (UClass* FoundClass = FindFirstObject<UClass>(*ClassName, EFindFirstObjectOptions::ExactClass))
@@ -229,6 +424,86 @@ namespace
 		return nullptr;
 	}
 
+	// Blueprint functions and variables are registered against the transient SKELETON class
+	// (SKEL_<BP>_C) during editing; that name is not resolvable by create_node_by_key. Map a
+	// skeleton/generated class back to the persistent generated-class name so discover_nodes emits
+	// keys that round-trip. Native classes (no ClassGeneratedBy) pass through unchanged.
+	static FString GetResolvableClassName(const UClass* Class)
+	{
+		if (!Class)
+		{
+			return FString();
+		}
+		if (const UBlueprint* BP = Cast<UBlueprint>(Class->ClassGeneratedBy))
+		{
+			if (BP->GeneratedClass)
+			{
+				return BP->GeneratedClass->GetName();
+			}
+		}
+		return Class->GetName();
+	}
+
+	// Reduce a skeleton/generated Blueprint class to its authoritative (persistent generated) class
+	// so a class-hierarchy test is not defeated by the fact that variable spawners are registered
+	// against the SKEL_ class. Native classes pass through unchanged.
+	static UClass* GetAuthoritativeClass(UClass* Class)
+	{
+		if (Class)
+		{
+			if (const UBlueprint* BP = Cast<UBlueprint>(Class->ClassGeneratedBy))
+			{
+				if (BP->GeneratedClass)
+				{
+					return BP->GeneratedClass;
+				}
+			}
+		}
+		return Class;
+	}
+
+	// Single implementation of the compiler-message harvest so BuildGraph and CompileBlueprint agree
+	// on what counts as an error vs a warning. Prefix is prepended to each message (BuildGraph tags
+	// them "Compile: "; CompileBlueprint passes an empty prefix).
+	static void HarvestCompilerMessages(const FCompilerResultsLog& CompileResults, const FString& Prefix,
+		TArray<FString>& OutErrors, TArray<FString>& OutWarnings)
+	{
+		for (const TSharedRef<FTokenizedMessage>& Msg : CompileResults.Messages)
+		{
+			const FString MsgText = Msg->ToText().ToString();
+			if (Msg->GetSeverity() == EMessageSeverity::Error)
+			{
+				OutErrors.Add(Prefix + MsgText);
+			}
+			else if (Msg->GetSeverity() == EMessageSeverity::Warning || Msg->GetSeverity() == EMessageSeverity::PerformanceWarning)
+			{
+				OutWarnings.Add(Prefix + MsgText);
+			}
+		}
+	}
+
+	// Object/class default of a pin as an object path, empty when the pin holds none. Hard
+	// object/class pins store the resolved object in DefaultObject; soft object/class pins store
+	// the path string in DefaultValue. Lets get_node_pins report class/object defaults that the
+	// string-only DefaultValue field does not capture for hard reference pins.
+	static FString GetPinDefaultObjectPath(const UEdGraphPin* Pin)
+	{
+		if (!Pin)
+		{
+			return FString();
+		}
+		if (Pin->DefaultObject)
+		{
+			return Pin->DefaultObject->GetPathName();
+		}
+		const FName Cat = Pin->PinType.PinCategory;
+		if ((Cat == UEdGraphSchema_K2::PC_SoftObject || Cat == UEdGraphSchema_K2::PC_SoftClass) && !Pin->DefaultValue.IsEmpty())
+		{
+			return Pin->DefaultValue;
+		}
+		return FString();
+	}
+
 	// Loads a UScriptStruct by asset path. Accepts both full paths ("/Game/X/Foo.Foo")
 	// and package-only paths ("/Game/X/Foo") by auto-appending the asset name suffix.
 	static UScriptStruct* LoadStructByPath(const FString& StructPath)
@@ -301,6 +576,108 @@ namespace
 		}
 
 		return false;
+	}
+
+	// Result of trying to write a class/object default onto a pin.
+	//   NotApplicable — the pin is not a class/object reference pin; caller should fall back to
+	//                   Schema->TrySetDefaultValue (plain string default).
+	//   Applied        — the class/object was resolved and landed on the pin.
+	//   Failed         — the pin IS a class/object pin but the value could not be resolved, or the
+	//                    pin's metaclass/class rejected it (OutError describes which).
+	enum class EApplyPinDefaultResult : uint8 { NotApplicable, Applied, Failed };
+
+	// Shared class/object pin-default path used by BOTH SetNodePinValue and BuildGraph's pin-default
+	// loop (issue #552 follow-up). A hard class/object pin stores its default in Pin->DefaultObject,
+	// which Schema->TrySetDefaultValue (a string path) cannot write — so a build_graph pin_default
+	// like {"ActorClass":"/Script/Engine.StaticMeshActor"} used to silently no-op. Resolve the
+	// class/object, write the field that matches (soft pins keep the path string in DefaultValue),
+	// then read it back so a metaclass rejection is a hard failure, not a false success.
+	static EApplyPinDefaultResult ApplyPinDefault(UEdGraphPin* Pin, const FString& Value, FString& OutError)
+	{
+		if (!Pin)
+		{
+			OutError = TEXT("null pin");
+			return EApplyPinDefaultResult::Failed;
+		}
+
+		const FName PinCategory = Pin->PinType.PinCategory;
+		const bool bClass  = (PinCategory == UEdGraphSchema_K2::PC_Class  || PinCategory == UEdGraphSchema_K2::PC_SoftClass);
+		const bool bObject = (PinCategory == UEdGraphSchema_K2::PC_Object || PinCategory == UEdGraphSchema_K2::PC_SoftObject);
+		if (!bClass && !bObject)
+		{
+			return EApplyPinDefaultResult::NotApplicable;
+		}
+
+		const UEdGraphSchema_K2* K2Schema = nullptr;
+		if (const UEdGraphNode* OwningNode = Pin->GetOwningNodeUnchecked())
+		{
+			if (const UEdGraph* OwningGraph = OwningNode->GetGraph())
+			{
+				K2Schema = Cast<UEdGraphSchema_K2>(OwningGraph->GetSchema());
+			}
+		}
+
+		if (bClass)
+		{
+			// Resolve the class with U/A prefix fallbacks (mirrors SetNodePinValue's original path).
+			UClass* ResolvedClass = LoadObject<UClass>(nullptr, *Value);
+			if (!ResolvedClass)
+				ResolvedClass = FindFirstObject<UClass>(*Value, EFindFirstObjectOptions::ExactClass);
+			if (!ResolvedClass)
+				ResolvedClass = FindFirstObject<UClass>(*FString::Printf(TEXT("U%s"), *Value), EFindFirstObjectOptions::ExactClass);
+			if (!ResolvedClass)
+				ResolvedClass = FindFirstObject<UClass>(*FString::Printf(TEXT("A%s"), *Value), EFindFirstObjectOptions::ExactClass);
+
+			if (!ResolvedClass)
+			{
+				OutError = FString::Printf(TEXT("could not resolve class '%s' for class reference pin '%s'"), *Value, *Pin->PinName.ToString());
+				return EApplyPinDefaultResult::Failed;
+			}
+
+			const bool bSoft = (PinCategory == UEdGraphSchema_K2::PC_SoftClass);
+			if (K2Schema)
+				K2Schema->TrySetDefaultObject(*Pin, ResolvedClass);
+			else if (bSoft)
+				Pin->DefaultValue = ResolvedClass->GetPathName();
+			else
+				Pin->DefaultObject = ResolvedClass;
+
+			const bool bLanded = bSoft
+				? Pin->DefaultValue.Equals(ResolvedClass->GetPathName())
+				: (Pin->DefaultObject == ResolvedClass);
+			if (!bLanded)
+			{
+				OutError = FString::Printf(TEXT("class '%s' was not accepted on class pin '%s' (the pin's expected metaclass likely rejected it)"), *Value, *Pin->PinName.ToString());
+				return EApplyPinDefaultResult::Failed;
+			}
+			return EApplyPinDefaultResult::Applied;
+		}
+
+		// Object reference pin.
+		UObject* ResolvedObject = LoadObject<UObject>(nullptr, *Value);
+		if (!ResolvedObject)
+		{
+			OutError = FString::Printf(TEXT("could not load object '%s' for object reference pin '%s'"), *Value, *Pin->PinName.ToString());
+			return EApplyPinDefaultResult::Failed;
+		}
+
+		const bool bSoft = (PinCategory == UEdGraphSchema_K2::PC_SoftObject);
+		if (K2Schema)
+			K2Schema->TrySetDefaultObject(*Pin, ResolvedObject);
+		else if (bSoft)
+			Pin->DefaultValue = ResolvedObject->GetPathName();
+		else
+			Pin->DefaultObject = ResolvedObject;
+
+		const bool bLanded = bSoft
+			? Pin->DefaultValue.Equals(ResolvedObject->GetPathName())
+			: (Pin->DefaultObject == ResolvedObject);
+		if (!bLanded)
+		{
+			OutError = FString::Printf(TEXT("object '%s' was not accepted on object pin '%s' (the pin's expected class likely rejected it)"), *Value, *Pin->PinName.ToString());
+			return EApplyPinDefaultResult::Failed;
+		}
+		return EApplyPinDefaultResult::Applied;
 	}
 
 	static UBlueprintFunctionNodeSpawner* FindBestFunctionSpawner(
@@ -394,6 +771,187 @@ namespace
 		return BestScore > 20 ? BestSpawner : nullptr;
 	}
 
+	// Item 16: map a "Get X"/"Set X" spawner menu name (or a bare name) to an SCS or inherited
+	// component variable that belongs to the TARGET blueprint's own class hierarchy. The Blueprint
+	// action database does not reliably register a spawner for SCS component variables (so
+	// "SPAWN K2Node_VariableGet|Get <Component>" returned an empty id), and any same-named spawner it
+	// does surface may belong to an unrelated blueprint. Returns the actual member FName, or NAME_None
+	// when no component of the target matches. Matching ignores case and non-alphanumerics so the
+	// display name ("Static Mesh") lines up with the variable name ("StaticMesh").
+	static FName ResolveSelfComponentVariable(UBlueprint* Blueprint, const FString& MenuOrVarName)
+	{
+		if (!Blueprint)
+		{
+			return NAME_None;
+		}
+
+		FString Requested = MenuOrVarName;
+		Requested.TrimStartAndEndInline();
+		if (Requested.StartsWith(TEXT("Get "), ESearchCase::IgnoreCase))
+			Requested = Requested.RightChop(4);
+		else if (Requested.StartsWith(TEXT("Set "), ESearchCase::IgnoreCase))
+			Requested = Requested.RightChop(4);
+
+		const FString NormRequested = NormalizeBlueprintNodeSearchText(Requested);
+		if (NormRequested.IsEmpty())
+		{
+			return NAME_None;
+		}
+
+		// 1. SCS nodes declared on this blueprint (covers components added before a compile has
+		// reflected them onto the generated class).
+		if (USimpleConstructionScript* SCS = Blueprint->SimpleConstructionScript)
+		{
+			for (USCS_Node* Node : SCS->GetAllNodes())
+			{
+				if (!Node)
+				{
+					continue;
+				}
+				const FName VarName = Node->GetVariableName();
+				if (!VarName.IsNone() && NormalizeBlueprintNodeSearchText(VarName.ToString()) == NormRequested)
+				{
+					return VarName;
+				}
+			}
+		}
+
+		// 2. Component object properties on the generated class (covers inherited native components).
+		if (UClass* GenClass = Blueprint->GeneratedClass)
+		{
+			for (TFieldIterator<FProperty> It(GenClass); It; ++It)
+			{
+				if (const FObjectProperty* ObjProp = CastField<FObjectProperty>(*It))
+				{
+					if (ObjProp->PropertyClass && ObjProp->PropertyClass->IsChildOf(UActorComponent::StaticClass()) &&
+						NormalizeBlueprintNodeSearchText(ObjProp->GetName()) == NormRequested)
+					{
+						return ObjProp->GetFName();
+					}
+				}
+			}
+		}
+
+		return NAME_None;
+	}
+
+	// Does this property answer to the requested (already normalised) name? A menu name is the
+	// property's DISPLAY string, not its raw name — and for a bool the display string drops the
+	// Hungarian "b" prefix, so AActor::bCanBeDamaged surfaces in the menu as "Can Be Damaged".
+	// Matching the raw name alone therefore misses every boolean, which is exactly what made the
+	// qualified key "…|Get Can Be Damaged|Actor" fail. Try both spellings.
+	static bool PropertyMatchesSearchName(const FProperty* Property, const FString& NormRequested)
+	{
+		if (!Property)
+		{
+			return false;
+		}
+		if (NormalizeBlueprintNodeSearchText(Property->GetName()) == NormRequested)
+		{
+			return true;
+		}
+		const FString DisplayName = FName::NameToDisplayString(Property->GetName(), Property->IsA<FBoolProperty>());
+		return NormalizeBlueprintNodeSearchText(DisplayName) == NormRequested;
+	}
+
+	// Issue #609: the same action-database staleness that hid SCS component variables (see
+	// ResolveSelfComponentVariable above) also hides a member variable that was just added with
+	// add_member_variable — the DB has no spawner for it yet, so "SPAWN K2Node_VariableGet|Get My Var"
+	// returned an empty id and the natural "add a variable, then wire it up" flow failed on step two.
+	// This resolves any variable the TARGET Blueprint genuinely owns (its own NewVariables, or an
+	// inherited property on its class hierarchy) so it can be bound directly as a self member, using
+	// the same normalised-name matching as the component resolver ("My Var" <-> "MyVar").
+	// It deliberately does NOT widen what is reachable: a property owned by an unrelated class is not
+	// on this Blueprint's hierarchy and still falls through to the ownership check.
+	static FName ResolveSelfMemberVariable(UBlueprint* Blueprint, const FString& MenuOrVarName)
+	{
+		if (!Blueprint)
+		{
+			return NAME_None;
+		}
+
+		FString Requested = MenuOrVarName;
+		Requested.TrimStartAndEndInline();
+		if (Requested.StartsWith(TEXT("Get "), ESearchCase::IgnoreCase))
+			Requested = Requested.RightChop(4);
+		else if (Requested.StartsWith(TEXT("Set "), ESearchCase::IgnoreCase))
+			Requested = Requested.RightChop(4);
+
+		const FString NormRequested = NormalizeBlueprintNodeSearchText(Requested);
+		if (NormRequested.IsEmpty())
+		{
+			return NAME_None;
+		}
+
+		// 1. Variables declared on this Blueprint, including ones added moments ago that no compile
+		//    has reflected onto the generated class yet.
+		for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+		{
+			if (Var.VarName.IsNone())
+			{
+				continue;
+			}
+			const FString RawName = Var.VarName.ToString();
+			// Same display-name rule as PropertyMatchesSearchName: a bool declared "bIsOpen" appears
+			// in the menu as "Is Open".
+			const bool bIsBool = (Var.VarType.PinCategory == UEdGraphSchema_K2::PC_Boolean);
+			if (NormalizeBlueprintNodeSearchText(RawName) == NormRequested
+				|| NormalizeBlueprintNodeSearchText(FName::NameToDisplayString(RawName, bIsBool)) == NormRequested)
+			{
+				return Var.VarName;
+			}
+		}
+
+		// 2. Any property on the generated class (covers inherited native/Blueprint variables).
+		if (UClass* GenClass = Blueprint->GeneratedClass)
+		{
+			for (TFieldIterator<FProperty> It(GenClass); It; ++It)
+			{
+				if (PropertyMatchesSearchName(*It, NormRequested))
+				{
+					return It->GetFName();
+				}
+			}
+		}
+
+		return NAME_None;
+	}
+
+	// Issue #610: bind a variable get/set to an EXPLICITLY named owning class, for the qualified-key
+	// form "SPAWN K2Node_VariableGet|Get Jump Max Count|Character". Returns the resolved property's
+	// name and fills OutOwnerClass, or NAME_None when the class or the property cannot be resolved.
+	static FName ResolveExplicitOwnerVariable(const FString& OwnerClassName, const FString& MenuOrVarName, UClass*& OutOwnerClass)
+	{
+		OutOwnerClass = ResolveClassByName(OwnerClassName);
+		if (!OutOwnerClass)
+		{
+			return NAME_None;
+		}
+
+		FString Requested = MenuOrVarName;
+		Requested.TrimStartAndEndInline();
+		if (Requested.StartsWith(TEXT("Get "), ESearchCase::IgnoreCase))
+			Requested = Requested.RightChop(4);
+		else if (Requested.StartsWith(TEXT("Set "), ESearchCase::IgnoreCase))
+			Requested = Requested.RightChop(4);
+
+		const FString NormRequested = NormalizeBlueprintNodeSearchText(Requested);
+		if (NormRequested.IsEmpty())
+		{
+			return NAME_None;
+		}
+
+		for (TFieldIterator<FProperty> It(OutOwnerClass); It; ++It)
+		{
+			if (PropertyMatchesSearchName(*It, NormRequested))
+			{
+				return It->GetFName();
+			}
+		}
+
+		return NAME_None;
+	}
+
 	static FString BuildEventSpawnerKey(const UBlueprintEventNodeSpawner* EventSpawner)
 	{
 		if (!EventSpawner)
@@ -423,8 +981,40 @@ UBlueprint* UBlueprintService::LoadBlueprint(const FString& BlueprintPath)
 		return nullptr;
 	}
 
+	// Under Play-In-Editor the editor asset often will not resolve and BlueprintService edits are
+	// unsafe, so callers used to get an empty/False result with no explanation. Make the refusal
+	// visible with a fixed PIE_ACTIVE: prefix naming the Blueprint path (LoadBlueprint is the shared
+	// choke point every BlueprintService entry point funnels through). Return type is unchanged.
+	if (GEditor && GEditor->PlayWorld)
+	{
+		UE_LOG(LogTemp, Error, TEXT("PIE_ACTIVE: LoadBlueprint refused '%s' — a Play-In-Editor session is running; stop PIE before using BlueprintService."), *BlueprintPath);
+	}
+
+	// Subobject paths (":" present) don't load through the asset library — resolve them
+	// directly. Covers explicit LevelScriptBlueprint paths like
+	// /Game/Maps/MyMap.MyMap:PersistentLevel.MyMap.
+	if (BlueprintPath.Contains(TEXT(":")))
+	{
+		return Cast<UBlueprint>(StaticLoadObject(UObject::StaticClass(), nullptr, *BlueprintPath));
+	}
+
 	UObject* LoadedObject = UEditorAssetLibrary::LoadAsset(BlueprintPath);
-	return Cast<UBlueprint>(LoadedObject);
+	if (UBlueprint* Blueprint = Cast<UBlueprint>(LoadedObject))
+	{
+		return Blueprint;
+	}
+
+	// A map/world path resolves to its persistent level's Level Blueprint, so every
+	// BlueprintService function works on level scripts by passing the map path.
+	if (const UWorld* World = Cast<UWorld>(LoadedObject))
+	{
+		if (World->PersistentLevel)
+		{
+			return World->PersistentLevel->GetLevelScriptBlueprint(/*bDontCreate*/ false);
+		}
+	}
+
+	return nullptr;
 }
 
 bool UBlueprintService::GetBlueprintInfo(const FString& BlueprintPath, FBlueprintDetailedInfo& OutInfo)
@@ -590,6 +1180,7 @@ TArray<FBlueprintGraphInfo> UBlueprintService::ListGraphs(const FString& Bluepri
 			Info.GraphName = Graph->GetName();
 			Info.GraphKind = Kind;
 			Info.NodeCount = Graph->Nodes.Num();
+			Info.GraphPath = Graph->GetPathName();
 			Graphs.Add(MoveTemp(Info));
 		}
 	};
@@ -602,6 +1193,28 @@ TArray<FBlueprintGraphInfo> UBlueprintService::ListGraphs(const FString& Bluepri
 	AppendGraphs(Blueprint->FunctionGraphs,          TEXT("Function"));
 	AppendGraphs(Blueprint->MacroGraphs,             TEXT("Macro"));
 	AppendGraphs(Blueprint->DelegateSignatureGraphs, TEXT("DelegateSignature"));
+
+	// Return-valued interface functions are auto-materialised as graphs stored per interface
+	// (FBPInterfaceDescription::Graphs), NOT in FunctionGraphs, so the loops above miss them.
+	// Emit one entry per interface graph, tagging the kind with the interface name so callers can
+	// tell which interface it came from ("Interface (BPI_HingedDoor)").
+	for (const FBPInterfaceDescription& Intf : Blueprint->ImplementedInterfaces)
+	{
+		const FString IntfName = Intf.Interface ? Intf.Interface->GetName() : TEXT("Unknown");
+		for (UEdGraph* Graph : Intf.Graphs)
+		{
+			if (!Graph)
+			{
+				continue;
+			}
+			FBlueprintGraphInfo Info;
+			Info.GraphName = Graph->GetName();
+			Info.GraphKind = FString::Printf(TEXT("Interface (%s)"), *IntfName);
+			Info.NodeCount = Graph->Nodes.Num();
+			Info.GraphPath = Graph->GetPathName();
+			Graphs.Add(MoveTemp(Info));
+		}
+	}
 
 	return Graphs;
 }
@@ -725,6 +1338,23 @@ TArray<FBlueprintComponentInfo> UBlueprintService::ListComponents(const FString&
 	USCS_Node* ActualRootNode = FindActualSceneRootNode(SCS);
 
 	const TArray<USCS_Node*>& AllNodes = SCS->GetAllNodes();
+
+	// Same-SCS attachment lives only in the parents' ChildNodes arrays (see AttachSameScsChild);
+	// ParentComponentOrVariableName names inherited/native parents only. Map each node to its
+	// same-SCS tree parent so AttachParent reports both kinds of attachment.
+	TMap<USCS_Node*, USCS_Node*> SameScsParent;
+	for (USCS_Node* Node : AllNodes)
+	{
+		if (!Node)
+		{
+			continue;
+		}
+		for (USCS_Node* ChildNode : Node->GetChildNodes())
+		{
+			SameScsParent.Add(ChildNode, Node);
+		}
+	}
+
 	for (USCS_Node* Node : AllNodes)
 	{
 		if (!Node)
@@ -744,6 +1374,10 @@ TArray<FBlueprintComponentInfo> UBlueprintService::ListComponents(const FString&
 		if (Node->ParentComponentOrVariableName != NAME_None)
 		{
 			CompInfo.AttachParent = Node->ParentComponentOrVariableName.ToString();
+		}
+		else if (USCS_Node* const* TreeParent = SameScsParent.Find(Node))
+		{
+			CompInfo.AttachParent = (*TreeParent)->GetVariableName().ToString();
 		}
 
 		CompInfo.bIsRootComponent = (Node == ActualRootNode);
@@ -1000,6 +1634,26 @@ bool UBlueprintService::GetComponentInfo(const FString& ComponentType, FComponen
 	return true;
 }
 
+/**
+ * Attach Child under Parent within the SAME SimpleConstructionScript.
+ * ParentComponentOrVariableName (+ ParentComponentOwnerClassName / bIsParentComponentNative)
+ * is reserved for attachment to INHERITED (parent-class or native) components. When it names
+ * the node's own-SCS parent, the Blueprint compiles and behaves normally, but the engine's
+ * hierarchy fixup (FSceneHierarchyMapper::FixupParentage) fires the "possible cyclic linkage"
+ * ensure on package load — which BuildCookRun counts as an error after every package has
+ * already cooked (issues #371, #523). Same-SCS attachment is expressed by the parent's
+ * ChildNodes array alone; USCS_Node::SetParent must only be used for genuinely inherited
+ * parents. Clearing the fields here also heals nodes corrupted by earlier writes.
+ */
+static void AttachSameScsChild(USCS_Node* Parent, USCS_Node* Child)
+{
+	Parent->AddChildNode(Child);
+	Child->Modify();
+	Child->ParentComponentOrVariableName = NAME_None;
+	Child->ParentComponentOwnerClassName = NAME_None;
+	Child->bIsParentComponentNative = false;
+}
+
 bool UBlueprintService::AddComponent(
 	const FString& BlueprintPath,
 	const FString& ComponentType,
@@ -1079,11 +1733,9 @@ bool UBlueprintService::AddComponent(
 		
 		if (ParentNode)
 		{
-			// The parent is in this same SCS, so ChildNodes is the whole link. Do not call SetParent:
-			// it records ParentComponentOrVariableName, which is meant only for a parent inherited
-			// from another Blueprint. A same-SCS parent recorded there trips the FixupParentage
-			// ensure on load and failed the Android cook (exit 25, 2026-09-30).
-			ParentNode->AddChildNode(NewNode);
+			// ParentNode comes from this Blueprint's own SCS (the lookup above), so this must
+			// NOT go through SetParent — see AttachSameScsChild (issue #523).
+			AttachSameScsChild(ParentNode, NewNode);
 		}
 		else
 		{
@@ -1183,7 +1835,7 @@ bool UBlueprintService::RemoveComponent(
 			NodeToRemove->RemoveChildNode(Child);
 			if (ParentNode)
 			{
-				ParentNode->AddChildNode(Child);
+				AttachSameScsChild(ParentNode, Child);
 			}
 			else
 			{
@@ -1550,18 +2202,10 @@ bool UBlueprintService::SetRootComponent(
 	NewRootNode->ParentComponentOwnerClassName = NAME_None;
 	NewRootNode->bIsParentComponentNative = false;
 
-	// Attach a node as a same-SCS child of the new root. ParentComponentOrVariableName
-	// is reserved for attachment to INHERITED (parent-class/native) components — the
-	// engine's hierarchy fixup fires the "possible cyclic linkage" ensure on load/cook
-	// when it names the node's own SCS parent (issue #371). Same-SCS attachment is the
-	// ChildNodes array alone, with the inherited-parent linkage cleared.
+	// Attach a node as a same-SCS child of the new root (issue #371) — see AttachSameScsChild.
 	auto AttachUnderNewRoot = [NewRootNode](USCS_Node* Child)
 	{
-		NewRootNode->AddChildNode(Child);
-		Child->Modify();
-		Child->ParentComponentOrVariableName = NAME_None;
-		Child->ParentComponentOwnerClassName = NAME_None;
-		Child->bIsParentComponentNative = false;
+		AttachSameScsChild(NewRootNode, Child);
 	};
 
 	// If there was a current root, we need to handle it
@@ -1831,15 +2475,9 @@ bool UBlueprintService::ReparentComponent(
 		SCS->RemoveNode(NodeToReparent);
 	}
 	
-	// Add to new parent
-	NewParent->AddChildNode(NodeToReparent);
-
-	// NewParent is in this same SCS, so ChildNodes is the whole link. Clear any inherited-parent
-	// record the node carried instead of calling SetParent, which would record a same-SCS parent
-	// and trip the FixupParentage ensure on load (it failed the Android cook, 2026-09-30).
-	NodeToReparent->ParentComponentOrVariableName = NAME_None;
-	NodeToReparent->ParentComponentOwnerClassName = NAME_None;
-	NodeToReparent->bIsParentComponentNative = false;
+	// Add to new parent. NewParent comes from this Blueprint's own SCS (the lookup above),
+	// so this must NOT go through SetParent — see AttachSameScsChild (issue #523).
+	AttachSameScsChild(NewParent, NodeToReparent);
 	
 	// Mark blueprint as modified
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
@@ -1858,7 +2496,8 @@ bool UBlueprintService::AddMemberVariable(
 	const FString& VariableType,
 	const FString& DefaultValue,
 	bool bIsArray,
-	const FString& ContainerType)
+	const FString& ContainerType,
+	bool bInstanceEditable)
 {
 	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
 	if (!Blueprint)
@@ -1891,12 +2530,147 @@ bool UBlueprintService::AddMemberVariable(
 	NewVar.FriendlyName = VariableName;
 	NewVar.Category = FText::FromString(TEXT("Default"));
 	NewVar.DefaultValue = DefaultValue;
-	NewVar.PropertyFlags = CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
+	// CPF_DisableEditOnInstance keeps the variable blueprint-only (not editable per placed instance).
+	// Only set it when the caller did NOT ask for instance-editable, so bInstanceEditable=true yields
+	// a variable that the Details panel of a placed actor can edit.
+	NewVar.PropertyFlags = CPF_Edit | CPF_BlueprintVisible;
+	if (!bInstanceEditable)
+	{
+		NewVar.PropertyFlags |= CPF_DisableEditOnInstance;
+	}
 
 	Blueprint->NewVariables.Add(NewVar);
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
-	UE_LOG(LogTemp, Log, TEXT("AddMemberVariable: Added variable '%s' of type '%s' to %s"), *VariableName, *VariableType, *BlueprintPath);
+	UE_LOG(LogTemp, Log, TEXT("AddMemberVariable: Added variable '%s' of type '%s' to %s (instance_editable=%s)"), *VariableName, *VariableType, *BlueprintPath, bInstanceEditable ? TEXT("true") : TEXT("false"));
+	return true;
+}
+
+bool UBlueprintService::SetVariableInstanceEditable(
+	const FString& BlueprintPath,
+	const FString& VariableName,
+	bool bInstanceEditable)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Error, TEXT("SetVariableInstanceEditable: Failed to load blueprint: %s"), *BlueprintPath);
+		return false;
+	}
+
+	const FName VarFName(*VariableName);
+	if (FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, VarFName) == INDEX_NONE)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("SetVariableInstanceEditable: Variable '%s' not found in %s (must be one of this Blueprint's own variables)"), *VariableName, *BlueprintPath);
+		return false;
+	}
+
+	// SetBlueprintOnlyEditableFlag toggles CPF_DisableEditOnInstance and marks the Blueprint
+	// structurally modified. "Blueprint-only" is the inverse of "instance editable".
+	FBlueprintEditorUtils::SetBlueprintOnlyEditableFlag(Blueprint, VarFName, /*bNewBlueprintOnly*/ !bInstanceEditable);
+
+	UE_LOG(LogTemp, Log, TEXT("SetVariableInstanceEditable: '%s' on %s instance_editable=%s"), *VariableName, *BlueprintPath, bInstanceEditable ? TEXT("true") : TEXT("false"));
+	return true;
+}
+
+bool UBlueprintService::RemoveMemberVariable(
+	const FString& BlueprintPath,
+	const FString& VariableName,
+	bool bForce)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("RemoveMemberVariable: could not load blueprint: %s"), *BlueprintPath);
+		return false;
+	}
+
+	const FName VarFName(*VariableName);
+
+	// A component created through the Simple Construction Script surfaces as a variable too, but it is
+	// NOT in NewVariables — removing it must go through the component API, not this call.
+	if (Blueprint->SimpleConstructionScript)
+	{
+		for (const USCS_Node* Node : Blueprint->SimpleConstructionScript->GetAllNodes())
+		{
+			if (Node && Node->GetVariableName() == VarFName)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("RemoveMemberVariable: '%s' is a component on %s — remove it with the component API (remove_component), not remove_member_variable."), *VariableName, *BlueprintPath);
+				return false;
+			}
+		}
+	}
+
+	// The variable must be a real member variable (present in NewVariables).
+	bool bExists = false;
+	for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+	{
+		if (Var.VarName == VarFName)
+		{
+			bExists = true;
+			break;
+		}
+	}
+	if (!bExists)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("RemoveMemberVariable: variable '%s' not found in %s"), *VariableName, *BlueprintPath);
+		return false;
+	}
+
+	// Count references across ALL graphs: Get/Set nodes for THIS blueprint's own member variable.
+	// Require self-context and non-local scope so a same-named variable on another class (A8) or a
+	// same-named function-local variable is not counted.
+	TArray<UEdGraph*> Graphs;
+	Blueprint->GetAllGraphs(Graphs);
+	int32 TotalRefs = 0;
+	TArray<FString> ReferencingGraphs;
+	for (UEdGraph* Graph : Graphs)
+	{
+		if (!Graph)
+		{
+			continue;
+		}
+		int32 GraphRefs = 0;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			const UK2Node_Variable* VarNode = Cast<UK2Node_Variable>(Node);
+			if (VarNode
+				&& VarNode->VariableReference.IsSelfContext()
+				&& !VarNode->VariableReference.IsLocalScope()
+				&& VarNode->GetVarName() == VarFName)
+			{
+				++GraphRefs;
+			}
+		}
+		if (GraphRefs > 0)
+		{
+			TotalRefs += GraphRefs;
+			ReferencingGraphs.Add(FString::Printf(TEXT("%s (%d)"), *Graph->GetName(), GraphRefs));
+		}
+	}
+
+	if (TotalRefs > 0 && !bForce)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("RemoveMemberVariable: '%s' is referenced by %d node(s) in %s: %s. Pass force=True to remove the variable and its referencing nodes."),
+			*VariableName, TotalRefs, *BlueprintPath, *FString::Join(ReferencingGraphs, TEXT(", ")));
+		return false;
+	}
+
+	// FBlueprintEditorUtils::RemoveMemberVariable removes the referencing Get/Set nodes as well.
+	FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, VarFName);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+	// Verify by readback — return true only when the variable is actually gone.
+	for (const FBPVariableDescription& Var : Blueprint->NewVariables)
+	{
+		if (Var.VarName == VarFName)
+		{
+			UE_LOG(LogTemp, Error, TEXT("RemoveMemberVariable: '%s' is still present after removal in %s"), *VariableName, *BlueprintPath);
+			return false;
+		}
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("RemoveMemberVariable: removed '%s' from %s (%d reference node(s) removed)"), *VariableName, *BlueprintPath, TotalRefs);
 	return true;
 }
 
@@ -1912,7 +2686,8 @@ bool UBlueprintService::SetVariableDefaultValue(
 		return false;
 	}
 
-	// Find the variable
+	// Find the variable among this Blueprint's OWN variables first — the fast path stores the
+	// default directly on the FBPVariableDescription.
 	for (FBPVariableDescription& Var : Blueprint->NewVariables)
 	{
 		if (Var.VarName.ToString() == VariableName)
@@ -1924,7 +2699,38 @@ bool UBlueprintService::SetVariableDefaultValue(
 		}
 	}
 
-	UE_LOG(LogTemp, Warning, TEXT("SetVariableDefaultValue: Variable '%s' not found in %s"), *VariableName, *BlueprintPath);
+	// Not one of our own variables — it may be inherited from a parent Blueprint/class. Inherited
+	// variables are not in NewVariables; their per-class default lives on the CDO. Resolve the
+	// FProperty on the generated class (which walks the whole class chain) and write the value
+	// straight into the CDO so the child's instances read it back.
+	UClass* GenClass = Blueprint->GeneratedClass;
+	FProperty* Property = GenClass ? GenClass->FindPropertyByName(FName(*VariableName)) : nullptr;
+	if (Property)
+	{
+		UObject* CDO = GenClass->GetDefaultObject();
+		if (!CDO)
+		{
+			UE_LOG(LogTemp, Error, TEXT("SetVariableDefaultValue: '%s' resolved on %s but the class has no CDO"), *VariableName, *BlueprintPath);
+			return false;
+		}
+
+		uint8* ValuePtr = Property->ContainerPtrToValuePtr<uint8>(CDO);
+		if (!FBlueprintEditorUtils::PropertyValueFromString(Property, DefaultValue, reinterpret_cast<uint8*>(CDO), CDO))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("SetVariableDefaultValue: could not parse '%s' into inherited variable '%s' (type %s) on %s"),
+				*DefaultValue, *VariableName, *Property->GetCPPType(), *BlueprintPath);
+			return false;
+		}
+
+		FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+		FString ReadBack;
+		Property->ExportTextItem_Direct(ReadBack, ValuePtr, ValuePtr, CDO, PPF_None);
+		UE_LOG(LogTemp, Log, TEXT("SetVariableDefaultValue: Set inherited '%s' CDO default to '%s' (readback '%s') on %s"),
+			*VariableName, *DefaultValue, *ReadBack, *BlueprintPath);
+		return true;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("SetVariableDefaultValue: Variable '%s' not found in %s (neither an own variable nor an inherited property)"), *VariableName, *BlueprintPath);
 	return false;
 }
 
@@ -3132,11 +3938,70 @@ UEdGraph* UBlueprintService::FindGraph(UBlueprint* Blueprint, const FString& Gra
 	TArray<UEdGraph*> Graphs;
 	Blueprint->GetAllGraphs(Graphs);
 
+	// Disambiguator 1: a full graph object path (Graph->GetPathName()) is unique even when
+	// several graphs share a short name — list_graphs reports it in FBlueprintGraphInfo.GraphPath.
+	for (UEdGraph* Graph : Graphs)
+	{
+		if (Graph && Graph->GetPathName() == GraphName)
+		{
+			return Graph;
+		}
+	}
+
+	// Exact short-name match — the common case. Count duplicates so an ambiguous name warns
+	// rather than silently aliasing to whichever graph happens to come first.
+	UEdGraph* FirstMatch = nullptr;
+	int32 MatchCount = 0;
 	for (UEdGraph* Graph : Graphs)
 	{
 		if (Graph && Graph->GetName() == GraphName)
 		{
-			return Graph;
+			if (!FirstMatch)
+			{
+				FirstMatch = Graph;
+			}
+			++MatchCount;
+		}
+	}
+
+	if (FirstMatch)
+	{
+		if (MatchCount > 1)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("FindGraph: %d graphs are named '%s' in blueprint '%s'; returning the first. ")
+				TEXT("Disambiguate by passing the graph object path (see list_graphs' graph_path) or '%s#<index>' (0-based, in GetAllGraphs order)."),
+				MatchCount, *GraphName, *Blueprint->GetName(), *GraphName);
+		}
+		return FirstMatch;
+	}
+
+	// Disambiguator 2: "Name#<index>" — 0-based index among same-named graphs in GetAllGraphs
+	// order. Only consulted when no graph literally matches GraphName, so a graph genuinely
+	// named "Foo#2" is still found by the exact match above.
+	int32 HashIdx = INDEX_NONE;
+	if (GraphName.FindLastChar(TEXT('#'), HashIdx) && HashIdx > 0)
+	{
+		const FString BaseName = GraphName.Left(HashIdx);
+		const FString IndexStr = GraphName.Mid(HashIdx + 1);
+		if (!IndexStr.IsEmpty() && IndexStr.IsNumeric())
+		{
+			const int32 WantIndex = FCString::Atoi(*IndexStr);
+			int32 Seen = 0;
+			for (UEdGraph* Graph : Graphs)
+			{
+				if (Graph && Graph->GetName() == BaseName)
+				{
+					if (Seen == WantIndex)
+					{
+						return Graph;
+					}
+					++Seen;
+				}
+			}
+			UE_LOG(LogTemp, Warning,
+				TEXT("FindGraph: index %d is out of range for graph name '%s' (%d match(es)) in blueprint '%s'"),
+				WantIndex, *BaseName, Seen, *Blueprint->GetName());
 		}
 	}
 
@@ -3692,7 +4557,8 @@ FString UBlueprintService::AddTimeline(
 	bool bAutoPlay,
 	bool bLoop,
 	float PosX,
-	float PosY)
+	float PosY,
+	bool bReplaceExisting)
 {
 	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
 	if (!Blueprint)
@@ -3717,8 +4583,33 @@ FString UBlueprintService::AddTimeline(
 	const FName DesiredName = TimelineName.IsEmpty() ? FBlueprintEditorUtils::FindUniqueTimelineName(Blueprint) : FName(*TimelineName);
 	if (Blueprint->FindTimelineTemplateByVariableName(DesiredName))
 	{
-		UE_LOG(LogTemp, Error, TEXT("AddTimeline: Timeline '%s' already exists on %s"), *DesiredName.ToString(), *BlueprintPath);
-		return FString();
+		// A leftover UTimelineTemplate (e.g. its Timeline node was deleted but the template stayed)
+		// blocks re-adding the same name. Previously this returned an empty string and logged only
+		// to UE_LOG, invisible from Python. Now: replace on request, otherwise return a visible
+		// "ERROR:" sentinel that says how to proceed.
+		if (bReplaceExisting)
+		{
+			if (!RemoveTimeline(BlueprintPath, DesiredName.ToString()))
+			{
+				const FString Sentinel = FString::Printf(TEXT("ERROR: Timeline '%s' already exists on %s and could not be removed for replacement"), *DesiredName.ToString(), *BlueprintPath);
+				UE_LOG(LogTemp, Error, TEXT("AddTimeline: %s"), *Sentinel);
+				return Sentinel;
+			}
+			// Re-resolve the graph: RemoveTimeline recompiles, which can invalidate the pointer.
+			Graph = ResolveBlueprintGraph(Blueprint, GraphName);
+			if (!Graph)
+			{
+				const FString Sentinel = FString::Printf(TEXT("ERROR: Graph '%s' not found in %s after removing timeline '%s'"), *GraphName, *BlueprintPath, *DesiredName.ToString());
+				UE_LOG(LogTemp, Error, TEXT("AddTimeline: %s"), *Sentinel);
+				return Sentinel;
+			}
+		}
+		else
+		{
+			const FString Sentinel = FString::Printf(TEXT("ERROR: Timeline '%s' already exists on %s (a deleted Timeline node can leave its template behind). Call remove_timeline first, or pass replace_existing=true."), *DesiredName.ToString(), *BlueprintPath);
+			UE_LOG(LogTemp, Error, TEXT("AddTimeline: %s"), *Sentinel);
+			return Sentinel;
+		}
 	}
 
 	// Create the Timeline node.
@@ -3889,9 +4780,9 @@ bool UBlueprintService::AddTimelineFloatKey(
 	return true;
 }
 
-TArray<FBlueprintFunctionParameterInfo> UBlueprintService::GetTimelines(const FString& BlueprintPath)
+TArray<FBlueprintTimelineInfo> UBlueprintService::GetTimelines(const FString& BlueprintPath)
 {
-	TArray<FBlueprintFunctionParameterInfo> Result;
+	TArray<FBlueprintTimelineInfo> Result;
 	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
 	if (!Blueprint)
 	{
@@ -3905,18 +4796,13 @@ TArray<FBlueprintFunctionParameterInfo> UBlueprintService::GetTimelines(const FS
 		{
 			continue;
 		}
-		FBlueprintFunctionParameterInfo Info;
-		Info.ParameterName = Template->GetVariableName().ToString();
-		TArray<FString> TrackNames;
-		for (const FTTFloatTrack& T : Template->FloatTracks) { TrackNames.Add(FString::Printf(TEXT("float:%s"), *T.GetTrackName().ToString())); }
-		for (const FTTVectorTrack& T : Template->VectorTracks) { TrackNames.Add(FString::Printf(TEXT("vector:%s"), *T.GetTrackName().ToString())); }
-		for (const FTTLinearColorTrack& T : Template->LinearColorTracks) { TrackNames.Add(FString::Printf(TEXT("color:%s"), *T.GetTrackName().ToString())); }
-		for (const FTTEventTrack& T : Template->EventTracks) { TrackNames.Add(FString::Printf(TEXT("event:%s"), *T.GetTrackName().ToString())); }
-		Info.ParameterType = FString::Join(TrackNames, TEXT(","));
-		Info.DefaultValue = FString::Printf(TEXT("Length=%.2f LengthMode=%s AutoPlay=%d Loop=%d Replicated=%d IgnoreTimeDilation=%d"),
-			Template->TimelineLength,
-			Template->LengthMode == ETimelineLengthMode::TL_LastKeyFrame ? TEXT("LastKeyFrame") : TEXT("Fixed"),
-			Template->bAutoPlay ? 1 : 0, Template->bLoop ? 1 : 0, Template->bReplicated ? 1 : 0, Template->bIgnoreTimeDilation ? 1 : 0);
+		FBlueprintTimelineInfo Info;
+		Info.TimelineName = Template->GetVariableName().ToString();
+		Info.TrackCount = Template->FloatTracks.Num() + Template->VectorTracks.Num()
+			+ Template->LinearColorTracks.Num() + Template->EventTracks.Num();
+		Info.Length = Template->TimelineLength;
+		Info.bLoop = Template->bLoop;
+		Info.bAutoPlay = Template->bAutoPlay;
 		Result.Add(Info);
 	}
 	return Result;
@@ -4699,6 +5585,7 @@ TArray<FBlueprintNodeInfo> UBlueprintService::GetNodesInGraph(
 					PinInfo.bIsInput = (Pin->Direction == EGPD_Input);
 					PinInfo.bIsConnected = Pin->LinkedTo.Num() > 0;
 					PinInfo.DefaultValue = Pin->DefaultValue;
+					PinInfo.DefaultObject = GetPinDefaultObjectPath(Pin);
 					NodeInfo.Pins.Add(PinInfo);
 				}
 			}
@@ -4822,6 +5709,7 @@ namespace
 			PinInfo.bIsInput = (Pin->Direction == EGPD_Input);
 			PinInfo.bIsConnected = Pin->LinkedTo.Num() > 0;
 			PinInfo.DefaultValue = Pin->DefaultValue;
+			PinInfo.DefaultObject = GetPinDefaultObjectPath(Pin);
 			NodeInfo.Pins.Add(PinInfo);
 		}
 
@@ -5514,6 +6402,7 @@ TArray<FBlueprintPinInfo> UBlueprintService::GetNodePins(
 		PinInfo.bIsInput = (Pin->Direction == EGPD_Input);
 		PinInfo.bIsConnected = Pin->LinkedTo.Num() > 0;
 		PinInfo.DefaultValue = Pin->DefaultValue;
+		PinInfo.DefaultObject = GetPinDefaultObjectPath(Pin);
 
 		PinInfos.Add(PinInfo);
 	}
@@ -5745,17 +6634,69 @@ bool UBlueprintService::SetProperty(
 	// Import property value from string. ImportText returns null on parse failure —
 	// report it instead of saving an unchanged asset and claiming success (issue #352).
 	void* PropertyAddr = Property->ContainerPtrToValuePtr<void>(CDO);
-	if (!Property->ImportText_Direct(*PropertyValue, PropertyAddr, CDO, PPF_None))
+	FScopedVibePropertyValue OriginalValue(Property);
+	Property->CopyCompleteValue(OriginalValue.GetData(), PropertyAddr);
+
+	FScopedVibePropertyValue ParsedValue(Property);
+	if (!ParsedValue || !Property->ImportText_Direct(*PropertyValue, ParsedValue.GetData(), CDO, PPF_None))
 	{
 		UE_LOG(LogTemp, Error, TEXT("SetProperty: Failed to parse '%s' for property '%s' (%s) — value rejected by ImportText"),
 			*PropertyValue, *PropertyName, *Property->GetClass()->GetName());
 		return false;
 	}
 
-	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
-	UEditorAssetLibrary::SaveAsset(BlueprintPath, false);
+	FString ExpectedValue;
+	Property->ExportTextItem_Direct(ExpectedValue, ParsedValue.GetData(), nullptr, CDO, PPF_None);
+	Property->CopyCompleteValue(PropertyAddr, ParsedValue.GetData());
 
-	UE_LOG(LogTemp, Log, TEXT("SetProperty: Set property '%s' = '%s'"), *PropertyName, *PropertyValue);
+	bool bHandledGameplayEffectCompatibilityProperty = false;
+	if (!TrySetGameplayEffectTagCompatibilityProperty(
+		CDO,
+		PropertyName,
+		PropertyValue,
+		bHandledGameplayEffectCompatibilityProperty,
+		ExpectedValue))
+	{
+		Property->CopyCompleteValue(PropertyAddr, OriginalValue.GetData());
+		return false;
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+	if (!UEditorAssetLibrary::SaveAsset(BlueprintPath, false))
+	{
+		UE_LOG(LogTemp, Error, TEXT("SetProperty: Failed to save blueprint: %s"), *BlueprintPath);
+		return false;
+	}
+
+	// A successful parse is not a successful write when PreSave or another engine callback
+	// replaces the value. Re-read the persisted CDO and report that case instead of returning a
+	// false positive (issue #539).
+	UBlueprint* SavedBlueprint = LoadBlueprint(BlueprintPath);
+	UClass* SavedClass = SavedBlueprint ? SavedBlueprint->GeneratedClass : nullptr;
+	UObject* SavedCDO = SavedClass ? SavedClass->GetDefaultObject() : nullptr;
+	FProperty* SavedProperty = SavedClass ? SavedClass->FindPropertyByName(*PropertyName) : nullptr;
+	if (!SavedCDO || !SavedProperty)
+	{
+		UE_LOG(LogTemp, Error, TEXT("SetProperty: Could not verify saved property '%s' on '%s'"),
+			*PropertyName, *BlueprintPath);
+		return false;
+	}
+
+	FString ActualValue;
+	const void* SavedPropertyAddr = SavedProperty->ContainerPtrToValuePtr<void>(SavedCDO);
+	SavedProperty->ExportTextItem_Direct(ActualValue, SavedPropertyAddr, nullptr, SavedCDO, PPF_None);
+	if (ActualValue != ExpectedValue)
+	{
+		UE_LOG(LogTemp, Error,
+			TEXT("SetProperty: Property '%s' was written as '%s' but the asset saved '%s'. An engine callback rewrote the value."),
+			*PropertyName, *ExpectedValue, *ActualValue);
+		return false;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("SetProperty: Set property '%s' = '%s'%s"),
+		*PropertyName,
+		*ActualValue,
+		bHandledGameplayEffectCompatibilityProperty ? TEXT(" through its GameplayEffect component") : TEXT(""));
 	return true;
 }
 
@@ -5917,7 +6858,12 @@ TArray<FBlueprintNodeTypeInfo> UBlueprintService::DiscoverNodes(
 			}
 		}
 		
-		FString SpawnerKey = FString::Printf(TEXT("FUNC %s::%s"), *OwnerClassName, *FuncName);
+		// A Blueprint's own functions can arrive owned by the transient skeleton class
+		// (SKEL_<BP>_C), whose name create_node_by_key cannot resolve. Emit the persistent
+		// generated-class name ("<BP>_C") so the key round-trips.
+		FString ResolvableOwner = OwnerClassName;
+		ResolvableOwner.RemoveFromStart(TEXT("SKEL_"), ESearchCase::CaseSensitive);
+		FString SpawnerKey = FString::Printf(TEXT("FUNC %s::%s"), *ResolvableOwner, *FuncName);
 		if (SeenSpawnerKeys.Contains(SpawnerKey))
 		{
 			return false;
@@ -6019,7 +6965,9 @@ TArray<FBlueprintNodeTypeInfo> UBlueprintService::DiscoverNodes(
 				{
 					return false;
 				}
-				SpawnerKey = FString::Printf(TEXT("FUNC %s::%s"), *Func->GetOwnerClass()->GetName(), *Func->GetName());
+				// Blueprint functions are owned by the transient skeleton class (SKEL_<BP>_C);
+				// emit the persistent generated-class name so create_node_by_key can resolve it.
+				SpawnerKey = FString::Printf(TEXT("FUNC %s::%s"), *GetResolvableClassName(Func->GetOwnerClass()), *Func->GetName());
 				bIsPure = Func->HasAnyFunctionFlags(FUNC_BlueprintPure);
 			}
 		}
@@ -6516,53 +7464,30 @@ bool UBlueprintService::SetNodePinValue(
 		return false;
 	}
 
-	// Set the default value — class/object reference pins use DefaultObject, not DefaultValue
+	// Set the default value. Class/object reference pins live in Pin->DefaultObject and go through
+	// the shared ApplyPinDefault helper (also used by BuildGraph). Everything else uses the schema
+	// string path below.
 	const UEdGraphSchema* Schema = Graph->GetSchema();
-	const UEdGraphSchema_K2* K2Schema = Cast<UEdGraphSchema_K2>(Schema);
 	const FName PinCategory = Pin->PinType.PinCategory;
 
-	if (PinCategory == UEdGraphSchema_K2::PC_Class || PinCategory == UEdGraphSchema_K2::PC_SoftClass)
 	{
-		// Resolve the class with U/A prefix fallbacks
-		UClass* ResolvedClass = LoadObject<UClass>(nullptr, *Value);
-		if (!ResolvedClass)
-			ResolvedClass = FindFirstObject<UClass>(*Value, EFindFirstObjectOptions::ExactClass);
-		if (!ResolvedClass)
-			ResolvedClass = FindFirstObject<UClass>(*FString::Printf(TEXT("U%s"), *Value), EFindFirstObjectOptions::ExactClass);
-		if (!ResolvedClass)
-			ResolvedClass = FindFirstObject<UClass>(*FString::Printf(TEXT("A%s"), *Value), EFindFirstObjectOptions::ExactClass);
+		FString PinDefaultError;
+		const EApplyPinDefaultResult ClassObjResult = ApplyPinDefault(Pin, Value, PinDefaultError);
+		if (ClassObjResult == EApplyPinDefaultResult::Failed)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("SetNodePinValue: %s on node '%s'; pin left unchanged"), *PinDefaultError, *NodeId);
+			return false;
+		}
+		if (ClassObjResult == EApplyPinDefaultResult::Applied)
+		{
+			FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+			UE_LOG(LogTemp, Log, TEXT("SetNodePinValue: Set pin '%s' on node '%s' to '%s'"), *PinName, *NodeId, *Value);
+			return true;
+		}
+		// NotApplicable — fall through to the wildcard/byte/plain string paths below.
+	}
 
-		if (ResolvedClass)
-		{
-			if (K2Schema)
-				K2Schema->TrySetDefaultObject(*Pin, ResolvedClass);
-			else
-				Pin->DefaultObject = ResolvedClass;
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error, TEXT("SetNodePinValue: Could not resolve class '%s' for class reference pin '%s'"), *Value, *PinName);
-			return false;
-		}
-	}
-	else if (PinCategory == UEdGraphSchema_K2::PC_Object || PinCategory == UEdGraphSchema_K2::PC_SoftObject)
-	{
-		// Load object by path and set DefaultObject
-		UObject* ResolvedObject = LoadObject<UObject>(nullptr, *Value);
-		if (ResolvedObject)
-		{
-			if (K2Schema)
-				K2Schema->TrySetDefaultObject(*Pin, ResolvedObject);
-			else
-				Pin->DefaultObject = ResolvedObject;
-		}
-		else
-		{
-			UE_LOG(LogTemp, Error, TEXT("SetNodePinValue: Could not load object '%s' for object reference pin '%s'"), *Value, *PinName);
-			return false;
-		}
-	}
-	else if (PinCategory == UEdGraphSchema_K2::PC_Wildcard)
+	if (PinCategory == UEdGraphSchema_K2::PC_Wildcard)
 	{
 		// BUG-2 fix (issue #373): wildcard pins (e.g. K2Node_Select case pins
 		// "NewEnumerator0..N" before the enum index resolves them) cannot store a
@@ -7136,11 +8061,17 @@ FString UBlueprintService::CreateNodeByKey(
 	}
 	else if (KeyType.Equals(TEXT("SPAWN"), ESearchCase::IgnoreCase))
 	{
-		// SPAWN <NodeClassName>|<MenuName> — re-find the exact action-database spawner
+		// SPAWN <NodeClassName>|<MenuName>[|<OwnerClass>] — re-find the exact action-database spawner
 		// (matched by node class + primed menu name) and Invoke it, so template /
 		// variable / custom nodes are created fully bound exactly as the editor's
 		// Add-Node menu would (e.g. Get Subsystem's CustomClass, a variable's member
 		// reference). Split on the FIRST '|' only — node class names never contain it.
+		//
+		// The OPTIONAL third component is the qualified-key form (issue #610). The foreign-variable
+		// refusal below used to tell callers to "pass a fully qualified key" while no such syntax
+		// existed, leaving a legitimate cross-class variable getter (another class's property wired
+		// through the node's Target pin) unreachable. Naming the owning class explicitly states the
+		// intent, so the ownership heuristic is skipped for that call only.
 		FString NodeClassName, MenuName;
 		if (!KeyValue.Split(TEXT("|"), &NodeClassName, &MenuName))
 		{
@@ -7148,8 +8079,23 @@ FString UBlueprintService::CreateNodeByKey(
 			return FString();
 		}
 
+		FString ExplicitOwnerName;
+		{
+			FString MenuOnly, OwnerPart;
+			if (MenuName.Split(TEXT("|"), &MenuOnly, &OwnerPart))
+			{
+				MenuName = MenuOnly.TrimStartAndEnd();
+				ExplicitOwnerName = OwnerPart.TrimStartAndEnd();
+			}
+		}
+
+		// A friendly menu name (e.g. "Get Inventory Component") is NOT unique across Blueprints:
+		// every Blueprint that declares a same-named variable registers a spawner with the same
+		// node class + menu name, so the first match may bind a variable that belongs to an
+		// UNRELATED Blueprint ("uses an invalid target" + a bogus cast error). Collect ALL matches
+		// so a variable get/set can be scoped to the target Blueprint's own class hierarchy.
 		const FBlueprintActionDatabase::FActionRegistry& ActionRegistry = FBlueprintActionDatabase::Get().GetAllActions();
-		UBlueprintNodeSpawner* MatchSpawner = nullptr;
+		TArray<UBlueprintNodeSpawner*> Matches;
 		for (const TPair<FObjectKey, FBlueprintActionDatabase::FActionList>& Entry : ActionRegistry)
 		{
 			for (UBlueprintNodeSpawner* Candidate : Entry.Value)
@@ -7163,23 +8109,169 @@ FString UBlueprintService::CreateNodeByKey(
 				const FBlueprintActionUiSpec& CandidateUi = Candidate->PrimeDefaultUiSpec(nullptr);
 				if (CandidateUi.MenuName.ToString() == MenuName)
 				{
-					MatchSpawner = Candidate;
-					break;
+					Matches.Add(Candidate);
 				}
 			}
-			if (MatchSpawner)
+		}
+
+		UBlueprintNodeSpawner* MatchSpawner = nullptr;
+		const bool bIsVariableNode = NodeClassName == TEXT("K2Node_VariableGet") || NodeClassName == TEXT("K2Node_VariableSet");
+
+		// Build a variable get/set node bound to an already-resolved member. OwnerClass == nullptr
+		// means "self member" (this Blueprint or its hierarchy); a non-null OwnerClass produces the
+		// external-member form, which carries a Target pin the caller wires up.
+		auto MakeVariableNode = [&](FName MemberName, UClass* OwnerClass) -> UEdGraphNode*
+		{
+			UK2Node_Variable* VarNode = (NodeClassName == TEXT("K2Node_VariableGet"))
+				? static_cast<UK2Node_Variable*>(NewObject<UK2Node_VariableGet>(Graph))
+				: static_cast<UK2Node_Variable*>(NewObject<UK2Node_VariableSet>(Graph));
+
+			if (OwnerClass)
 			{
-				break;
+				VarNode->VariableReference.SetExternalMember(MemberName, OwnerClass);
+			}
+			else
+			{
+				VarNode->VariableReference.SetSelfMember(MemberName);
+			}
+
+			Graph->AddNode(VarNode, false, false);
+			VarNode->CreateNewGuid();
+			VarNode->PostPlacedNewNode();
+			VarNode->AllocateDefaultPins();
+			VarNode->NodePosX = PosX;
+			VarNode->NodePosY = PosY;
+			return VarNode;
+		};
+
+		// Qualified key (issue #610): the caller named the owning class explicitly, so this is a
+		// deliberate cross-class get/set. Bind it and skip the ownership heuristic entirely — the
+		// whole point of the syntax is to say "yes, I mean that other class's property".
+		if (bIsVariableNode && !ExplicitOwnerName.IsEmpty())
+		{
+			UClass* OwnerClass = nullptr;
+			const FName OwnedVar = ResolveExplicitOwnerVariable(ExplicitOwnerName, MenuName, OwnerClass);
+			if (OwnedVar.IsNone())
+			{
+				UE_LOG(LogTemp, Error,
+					TEXT("CreateNodeByKey: qualified SPAWN key '%s' — %s. Expected '<NodeClass>|<MenuName>|<OwnerClass>', e.g. 'K2Node_VariableGet|Get Jump Max Count|Character'."),
+					*KeyValue,
+					OwnerClass ? TEXT("the class resolved but has no such property") : TEXT("the owner class could not be resolved"));
+				return FString();
+			}
+
+			// A self-owned variable does not need (and should not get) a Target pin: if the target
+			// Blueprint is actually a child of the named owner, bind it as a self member instead.
+			UClass* TargetClass = GetAuthoritativeClass(Blueprint->GeneratedClass ? Blueprint->GeneratedClass : Blueprint->ParentClass);
+			UClass* AuthoritativeOwner = GetAuthoritativeClass(OwnerClass);
+			const bool bIsSelf = TargetClass && AuthoritativeOwner && TargetClass->IsChildOf(AuthoritativeOwner);
+
+			NewNode = MakeVariableNode(OwnedVar, bIsSelf ? nullptr : OwnerClass);
+			UE_LOG(LogTemp, Log,
+				TEXT("CreateNodeByKey: Bound %s variable '%s' on '%s' via qualified SPAWN key '%s'"),
+				bIsSelf ? TEXT("self") : TEXT("external"), *OwnedVar.ToString(), *GetNameSafe(OwnerClass), *KeyValue);
+		}
+
+		// Item 16: a get/set for one of the target Blueprint's OWN SCS or inherited component
+		// variables binds directly, bypassing the action database. The action DB does not reliably
+		// register a spawner for SCS component variables (so this key returned an empty id and fell
+		// through below), and any same-named spawner it does surface may belong to another Blueprint.
+		// Resolve the member fully BEFORE adding a node so no failure path can leave an orphan.
+		if (!NewNode && bIsVariableNode)
+		{
+			const FName ComponentVar = ResolveSelfComponentVariable(Blueprint, MenuName);
+			if (!ComponentVar.IsNone())
+			{
+				NewNode = MakeVariableNode(ComponentVar, nullptr);
+				UE_LOG(LogTemp, Log, TEXT("CreateNodeByKey: Bound self component variable '%s' directly for SPAWN key '%s'"), *ComponentVar.ToString(), *KeyValue);
 			}
 		}
 
-		if (!MatchSpawner)
+		if (!NewNode)
 		{
-			UE_LOG(LogTemp, Error, TEXT("CreateNodeByKey: No action-database spawner matched SPAWN key '%s'"), *KeyValue);
-			return FString();
-		}
+			// Item 4: the owner check applies to the single-match case too — a lone match that belongs
+			// to an unrelated Blueprint must be refused, not silently bound (it was only guarded for
+			// Matches.Num() > 1 before).
+			if (bIsVariableNode && Matches.Num() >= 1)
+			{
+				// Prefer the variable whose owning class is the target Blueprint's own class or one of
+				// its parents. Variable spawners are registered against the SKELETON class, so compare
+				// both sides through their authoritative (persistent generated) class.
+				UClass* TargetClass = GetAuthoritativeClass(Blueprint->GeneratedClass ? Blueprint->GeneratedClass : Blueprint->ParentClass);
+				TArray<FString> CandidateOwners;
+				for (UBlueprintNodeSpawner* Candidate : Matches)
+				{
+					UClass* VarOwner = nullptr;
+					if (UBlueprintVariableNodeSpawner* VarSpawner = Cast<UBlueprintVariableNodeSpawner>(Candidate))
+					{
+						if (const FProperty* VarProp = VarSpawner->GetVarProperty())
+						{
+							VarOwner = VarProp->GetOwnerClass();
+						}
+					}
+					CandidateOwners.AddUnique(VarOwner ? VarOwner->GetName() : TEXT("<local/unknown>"));
 
-		NewNode = MatchSpawner->Invoke(Graph, IBlueprintNodeBinder::FBindingSet(), FVector2D(PosX, PosY));
+					UClass* AuthoritativeOwner = GetAuthoritativeClass(VarOwner);
+					if (TargetClass && AuthoritativeOwner && TargetClass->IsChildOf(AuthoritativeOwner))
+					{
+						MatchSpawner = Candidate;
+						break;
+					}
+				}
+
+				if (!MatchSpawner)
+				{
+					// Issue #610: name the syntax that actually exists. This used to say "pass a fully
+					// qualified key" while the key parser accepted only two components, so the advice
+					// could not be followed and there was no way to express a deliberate cross-class get/set.
+					UE_LOG(LogTemp, Warning,
+						TEXT("CreateNodeByKey: SPAWN key '%s' matched %d variable spawner(s), none owned by '%s' or a parent (candidate owners: %s). ")
+						TEXT("Refusing to bind an unrelated Blueprint's variable. Use a variable that exists on this Blueprint or its parents, or — if you ")
+						TEXT("deliberately want another class's property wired through a Target pin — qualify the key with its owning class: '%s|%s|<OwnerClass>' ")
+						TEXT("(e.g. '%s|%s|%s')."),
+						*KeyValue, Matches.Num(), *GetNameSafe(TargetClass), *FString::Join(CandidateOwners, TEXT(", ")),
+						*NodeClassName, *MenuName,
+						*NodeClassName, *MenuName, CandidateOwners.Num() > 0 ? *CandidateOwners[0] : TEXT("Character"));
+					return FString();
+				}
+			}
+			else if (Matches.Num() > 0)
+			{
+				MatchSpawner = Matches[0];
+			}
+
+			if (!MatchSpawner)
+			{
+				// Issue #609: the action database has no spawner for a variable that was added moments
+				// ago (add_member_variable then create_node_by_key), so the natural two-step flow failed
+				// here with an empty id. Fall back to binding the Blueprint's OWN member directly — the
+				// same escape the component resolver above already provides. Only reached when NOTHING
+				// matched, so it cannot loosen the foreign-variable refusal, which returns above.
+				if (bIsVariableNode)
+				{
+					const FName SelfVar = ResolveSelfMemberVariable(Blueprint, MenuName);
+					if (!SelfVar.IsNone())
+					{
+						NewNode = MakeVariableNode(SelfVar, nullptr);
+						UE_LOG(LogTemp, Log,
+							TEXT("CreateNodeByKey: Bound self member variable '%s' directly for SPAWN key '%s' (no action-database spawner yet)"),
+							*SelfVar.ToString(), *KeyValue);
+					}
+				}
+
+				if (!NewNode)
+				{
+					UE_LOG(LogTemp, Error, TEXT("CreateNodeByKey: No action-database spawner matched SPAWN key '%s'"), *KeyValue);
+					return FString();
+				}
+			}
+
+			// MatchSpawner is null when the self-member fallback above already built the node.
+			if (MatchSpawner)
+			{
+				NewNode = MatchSpawner->Invoke(Graph, IBlueprintNodeBinder::FBindingSet(), FVector2D(PosX, PosY));
+			}
+		}
 	}
 	else if (KeyType.Equals(TEXT("STRUCT"), ESearchCase::IgnoreCase))
 	{
@@ -7893,6 +8985,30 @@ bool UBlueprintService::OverrideFunction(const FString& BlueprintPath, const FSt
 		}
 	}
 
+	// Interface functions live in ImplementedInterfaces, not the parent-class chain. Scan the
+	// implemented interfaces so a function declared on an interface the Blueprint implements can be
+	// overridden the same way an inherited event/function is.
+	const FBPInterfaceDescription* InterfaceDesc = nullptr;
+	if (!TargetFunc)
+	{
+		for (const FBPInterfaceDescription& Intf : Blueprint->ImplementedInterfaces)
+		{
+			if (!Intf.Interface)
+			{
+				continue;
+			}
+			if (UFunction* Found = Intf.Interface->FindFunctionByName(FName(*FunctionName), EIncludeSuperFlag::IncludeSuper))
+			{
+				TargetFunc = Found;
+				FuncOwnerClass = Intf.Interface;
+				InterfaceDesc = &Intf;
+				break;
+			}
+		}
+	}
+
+	// An interface implemented by a native parent class is not in ImplementedInterfaces; its
+	// functions still override through the normal event/function path below.
 	if (!TargetFunc)
 	{
 		TargetFunc = FBlueprintEditorUtils::FindFunctionInImplementedInterfaces(
@@ -7903,6 +9019,68 @@ bool UBlueprintService::OverrideFunction(const FString& BlueprintPath, const FSt
 	if (!TargetFunc)
 	{
 		UE_LOG(LogTemp, Error, TEXT("OverrideFunction: '%s' not found in parent hierarchy or implemented interfaces of %s"), *FunctionName, *BlueprintPath);
+		return false;
+	}
+
+	// Interface functions take a dedicated path: a void one is an event node in the EventGraph
+	// (exactly like create_node_by_key's "EVENT <Iface>_C::<Fn>"), a return-valued one is
+	// materialised as a function graph when the interface is added, so we surface that existing graph.
+	// The FUNC_BlueprintEvent gate below does not apply to interface functions.
+	if (InterfaceDesc)
+	{
+		const FString FallbackKey = FString::Printf(TEXT("EVENT %s::%s"), *FuncOwnerClass->GetName(), *FunctionName);
+		const bool bInterfaceHasReturn = (TargetFunc->GetReturnProperty() != nullptr);
+
+		if (!bInterfaceHasReturn)
+		{
+			UEdGraph* EventGraph = FindGraph(Blueprint, TEXT("EventGraph"));
+			if (!EventGraph && Blueprint->UbergraphPages.Num() > 0)
+			{
+				EventGraph = Blueprint->UbergraphPages[0];
+			}
+			if (!EventGraph)
+			{
+				UE_LOG(LogTemp, Error, TEXT("OverrideFunction: EventGraph not found in %s (fallback: create_node_by_key with key '%s')"), *BlueprintPath, *FallbackKey);
+				return false;
+			}
+
+			// Idempotent — an interface event can exist only once.
+			for (UEdGraphNode* Node : EventGraph->Nodes)
+			{
+				if (UK2Node_Event* EventNode = Cast<UK2Node_Event>(Node))
+				{
+					if (EventNode->EventReference.GetMemberName().ToString().Equals(FunctionName, ESearchCase::IgnoreCase))
+					{
+						UE_LOG(LogTemp, Log, TEXT("OverrideFunction: Interface event '%s' already exists in EventGraph of %s"), *FunctionName, *BlueprintPath);
+						return true;
+					}
+				}
+			}
+
+			UK2Node_Event* EventNode = NewObject<UK2Node_Event>(EventGraph);
+			EventNode->EventReference.SetExternalMember(FName(*FunctionName), FuncOwnerClass);
+			EventNode->bOverrideFunction = true;
+			EventGraph->AddNode(EventNode, false, false);
+			EventNode->CreateNewGuid();
+			EventNode->PostPlacedNewNode();
+			EventNode->AllocateDefaultPins();
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+			UE_LOG(LogTemp, Log, TEXT("OverrideFunction: Added interface event node '%s' (%s) to EventGraph of %s"), *FunctionName, *FuncOwnerClass->GetName(), *BlueprintPath);
+			return true;
+		}
+
+		// Return-valued interface function: its implementation graph is auto-materialised in
+		// ImplementedInterfaces[i].Graphs when the interface is added. Return it if present.
+		for (UEdGraph* Graph : InterfaceDesc->Graphs)
+		{
+			if (Graph && Graph->GetName().Equals(FunctionName, ESearchCase::IgnoreCase))
+			{
+				UE_LOG(LogTemp, Log, TEXT("OverrideFunction: Interface function graph '%s' is available on %s"), *FunctionName, *BlueprintPath);
+				return true;
+			}
+		}
+
+		UE_LOG(LogTemp, Error, TEXT("OverrideFunction: return-valued interface function '%s' has no materialised graph on %s (re-add the interface, or drive the event directly with key '%s')"), *FunctionName, *BlueprintPath, *FallbackKey);
 		return false;
 	}
 
@@ -7982,6 +9160,142 @@ bool UBlueprintService::OverrideFunction(const FString& BlueprintPath, const FSt
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
 	UE_LOG(LogTemp, Log, TEXT("OverrideFunction: Created override function graph '%s' in %s"), *FunctionName, *BlueprintPath);
+	return true;
+}
+
+FString UBlueprintService::CreateFunctionGraph(const FString& BlueprintPath, const FString& FunctionName, bool bIsPure)
+{
+	// Issue #607: nothing exposed function-graph CREATION — override_function could only override an
+	// EXISTING inherited/interface function, so a Blueprint Interface (which is defined entirely by
+	// its function graphs) could never be authored from Python at all, and a plain Blueprint could
+	// not gain a new function. The engine call used below is the same one OverrideFunction and the
+	// plugin's own test fixtures already use; this just makes it reachable.
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Error, TEXT("CreateFunctionGraph: Failed to load blueprint: %s"), *BlueprintPath);
+		return FString();
+	}
+
+	const FString Trimmed = FunctionName.TrimStartAndEnd();
+	if (Trimmed.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error, TEXT("CreateFunctionGraph: function name is empty (%s)"), *BlueprintPath);
+		return FString();
+	}
+
+	// Refuse anything that is not a plain identifier — a name with spaces or punctuation produces a
+	// graph the compiler cannot emit a function for, which fails later and far from the cause.
+	for (int32 i = 0; i < Trimmed.Len(); ++i)
+	{
+		const TCHAR Ch = Trimmed[i];
+		const bool bValid = FChar::IsAlpha(Ch) || Ch == TEXT('_') || (i > 0 && FChar::IsDigit(Ch));
+		if (!bValid)
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("CreateFunctionGraph: '%s' is not a valid function name — use letters, digits and underscore, starting with a letter or underscore"),
+				*Trimmed);
+			return FString();
+		}
+	}
+
+	// Don't collide with an existing graph of any kind (function, macro, event graph, interface).
+	if (ResolveBlueprintGraph(Blueprint, Trimmed))
+	{
+		UE_LOG(LogTemp, Error, TEXT("CreateFunctionGraph: a graph named '%s' already exists in %s"), *Trimmed, *BlueprintPath);
+		return FString();
+	}
+
+	// Nor with a function the Blueprint already inherits — that is override_function's job, and
+	// creating a same-named new graph would shadow it and produce a duplicate-function compile error.
+	if (UClass* ParentClass = Blueprint->ParentClass)
+	{
+		if (ParentClass->FindFunctionByName(FName(*Trimmed), EIncludeSuperFlag::IncludeSuper))
+		{
+			UE_LOG(LogTemp, Error,
+				TEXT("CreateFunctionGraph: '%s' already exists on the parent hierarchy of %s — use override_function instead"),
+				*Trimmed, *BlueprintPath);
+			return FString();
+		}
+	}
+
+	UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
+		Blueprint,
+		FName(*Trimmed),
+		UEdGraph::StaticClass(),
+		UEdGraphSchema_K2::StaticClass()
+	);
+
+	if (!NewGraph)
+	{
+		UE_LOG(LogTemp, Error, TEXT("CreateFunctionGraph: Failed to create graph '%s' in %s"), *Trimmed, *BlueprintPath);
+		return FString();
+	}
+
+	// bIsUserCreated=true gives the graph the user-function treatment (entry node, editable
+	// signature); the null owner class means "this Blueprint's own function", not an override.
+	FBlueprintEditorUtils::AddFunctionGraph<UClass>(Blueprint, NewGraph, /*bIsUserCreated*/ true, (UClass*)nullptr);
+
+	if (bIsPure)
+	{
+		// Pure is a flag on the entry node, which AddFunctionGraph has just created.
+		TArray<UK2Node_FunctionEntry*> EntryNodes;
+		NewGraph->GetNodesOfClass<UK2Node_FunctionEntry>(EntryNodes);
+		if (EntryNodes.Num() > 0 && EntryNodes[0])
+		{
+			EntryNodes[0]->AddExtraFlags(FUNC_BlueprintPure);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("CreateFunctionGraph: created '%s' but found no entry node to mark pure; it is an impure function"),
+				*Trimmed);
+		}
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+	UE_LOG(LogTemp, Log, TEXT("CreateFunctionGraph: created %s function graph '%s' in %s"),
+		bIsPure ? TEXT("pure") : TEXT("impure"), *Trimmed, *BlueprintPath);
+	return NewGraph->GetName();
+}
+
+bool UBlueprintService::RefreshBlueprintEditor(const FString& BlueprintPath)
+{
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		UE_LOG(LogTemp, Error, TEXT("RefreshBlueprintEditor: Failed to load blueprint: %s"), *BlueprintPath);
+		return false;
+	}
+
+	UAssetEditorSubsystem* AssetEditorSubsystem = GEditor ? GEditor->GetEditorSubsystem<UAssetEditorSubsystem>() : nullptr;
+	if (!AssetEditorSubsystem)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("RefreshBlueprintEditor: AssetEditorSubsystem not available"));
+		return false;
+	}
+
+	IAssetEditorInstance* EditorInstance = AssetEditorSubsystem->FindEditorForAsset(Blueprint, /*bFocusIfOpen=*/false);
+	if (!EditorInstance)
+	{
+		UE_LOG(LogTemp, Log, TEXT("RefreshBlueprintEditor: Blueprint '%s' has no editor open — nothing to refresh"), *BlueprintPath);
+		return false;
+	}
+
+	// Rebuild node state on the Blueprint itself, then ask the open editor to redraw so the SCS
+	// viewport re-runs the construction script.
+	FBlueprintEditorUtils::RefreshAllNodes(Blueprint);
+
+	if (EditorInstance->GetEditorName() == FName(TEXT("BlueprintEditor"))
+		|| EditorInstance->GetEditorName() == FName(TEXT("WidgetBlueprintEditor"))
+		|| EditorInstance->GetEditorName() == FName(TEXT("AnimationBlueprintEditor")))
+	{
+		FBlueprintEditor* BlueprintEditor = static_cast<FBlueprintEditor*>(EditorInstance);
+		BlueprintEditor->RefreshEditors();
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("RefreshBlueprintEditor: refreshed open editor for '%s'"), *BlueprintPath);
 	return true;
 }
 
@@ -8652,8 +9966,51 @@ UEdGraphNode* UBlueprintService::CreateNodeFromDesc(
 			return nullptr;
 		}
 
+		// An override event (BeginPlay, Tick, overlaps, ...) can exist only once per Blueprint, and
+		// subclass templates ship ghost nodes for the common ones — adopt the existing node instead
+		// of stacking a duplicate (issue #551). Same contract as CreateNodeByKey (issue #349).
+		UClass* EventOwnerClass = EventFunction->GetOwnerClass();
+		UK2Node_Event* ExistingEvent = FBlueprintEditorUtils::FindOverrideForFunction(Blueprint, EventOwnerClass, EventFunction->GetFName());
+		if (!ExistingEvent)
+		{
+			// Ghost nodes can record the Blueprint's immediate parent rather than the declaring
+			// class as the member parent — match by name like OverrideFunction does.
+			for (UEdGraphNode* Node : Graph->Nodes)
+			{
+				UK2Node_Event* Candidate = Cast<UK2Node_Event>(Node);
+				if (Candidate && Candidate->bOverrideFunction &&
+					Candidate->EventReference.GetMemberName().ToString().Equals(*EventName, ESearchCase::IgnoreCase))
+				{
+					ExistingEvent = Candidate;
+					break;
+				}
+			}
+		}
+		if (ExistingEvent)
+		{
+			if (ExistingEvent->GetGraph() != Graph)
+			{
+				OutError = FString::Printf(TEXT("Node '%s': Event '%s' is already placed in graph '%s' — an override event can exist only once per Blueprint"),
+					*Desc.Ref, **EventName, *GetNameSafe(ExistingEvent->GetGraph()));
+				return nullptr;
+			}
+			ExistingEvent->Modify();
+			if (ExistingEvent->GetDesiredEnabledState() != ENodeEnabledState::Enabled)
+			{
+				// Ghost nodes ship disabled; adopting one for a build means the caller wants it live.
+				ExistingEvent->SetEnabledState(ENodeEnabledState::Enabled, /*bUserAction=*/false);
+			}
+			if (ExistingEvent->Pins.Num() == 0)
+			{
+				ExistingEvent->AllocateDefaultPins();
+			}
+			return ExistingEvent;
+		}
+
 		UK2Node_Event* EventNode = NewObject<UK2Node_Event>(Graph);
-		EventNode->EventReference.SetExternalMember(EventFunction->GetFName(), EventFunction->GetOwnerClass());
+		// Bind to the declaring class, not the immediate parent — a subclass parent class here made
+		// the reference miss the engine's existing-override comparison (issue #551).
+		EventNode->EventReference.SetExternalMember(FName(**EventName), EventOwnerClass);
 		EventNode->bOverrideFunction = true;
 		EventNode->NodePosX = PosX;
 		EventNode->NodePosY = PosY;
@@ -8669,6 +10026,22 @@ UEdGraphNode* UBlueprintService::CreateNodeFromDesc(
 	{
 		const FString* EventName = Desc.Params.Find(TEXT("name"));
 		FName CustomEventName = EventName && !EventName->IsEmpty() ? FName(**EventName) : NAME_None;
+
+		// Custom event names are unique per Blueprint — adopt an existing node instead of stacking
+		// a duplicate, matching CreateNodeByKey's contract (issue #551).
+		if (CustomEventName != NAME_None)
+		{
+			if (UK2Node_Event* ExistingCustom = FBlueprintEditorUtils::FindCustomEventNode(Blueprint, CustomEventName))
+			{
+				if (ExistingCustom->GetGraph() != Graph)
+				{
+					OutError = FString::Printf(TEXT("Node '%s': Custom event '%s' already exists in graph '%s'"),
+						*Desc.Ref, *CustomEventName.ToString(), *GetNameSafe(ExistingCustom->GetGraph()));
+					return nullptr;
+				}
+				return ExistingCustom;
+			}
+		}
 
 		UBlueprintEventNodeSpawner* EventSpawner = UBlueprintEventNodeSpawner::Create(UK2Node_CustomEvent::StaticClass(), CustomEventName);
 		if (!EventSpawner)
@@ -8708,7 +10081,13 @@ UEdGraphNode* UBlueprintService::CreateNodeFromDesc(
 			return nullptr;
 		}
 
-		UClass* TargetUClass = FindFirstObject<UClass>(**TargetClass, EFindFirstObjectOptions::None, ELogVerbosity::Warning, TEXT("BuildGraph"));
+		// ResolveClassByName handles "BP_Foo", "BP_Foo_C", and "/Game/..." forms and loads unloaded
+		// Blueprints — the bare FindFirstObject needed an exact, already-loaded "_C" name (issue #552).
+		UClass* TargetUClass = ResolveClassByName(**TargetClass);
+		if (!TargetUClass)
+		{
+			TargetUClass = FindFirstObject<UClass>(**TargetClass, EFindFirstObjectOptions::None, ELogVerbosity::Warning, TEXT("BuildGraph"));
+		}
 		if (!TargetUClass)
 		{
 			OutError = FString::Printf(TEXT("Node '%s': Cast target class '%s' not found"), *Desc.Ref, **TargetClass);
@@ -9003,13 +10382,18 @@ UEdGraphNode* UBlueprintService::CreateNodeFromDesc(
 			return nullptr;
 		}
 
-		UClass* OwnerClass = nullptr;
-		for (TObjectIterator<UClass> It; It; ++It)
+		// ResolveClassByName accepts "BP_Foo", "BP_Foo_C", and "/Game/..." forms and loads unloaded
+		// Blueprints; the raw iterator needed an exact, already-loaded class name (issue #552).
+		UClass* OwnerClass = ResolveClassByName(*ClassName);
+		if (!OwnerClass)
 		{
-			if (It->GetName() == *ClassName)
+			for (TObjectIterator<UClass> It; It; ++It)
 			{
-				OwnerClass = *It;
-				break;
+				if (It->GetName() == *ClassName)
+				{
+					OwnerClass = *It;
+					break;
+				}
 			}
 		}
 
@@ -9054,13 +10438,18 @@ UEdGraphNode* UBlueprintService::CreateNodeFromDesc(
 			return nullptr;
 		}
 
-		UClass* OwnerClass = nullptr;
-		for (TObjectIterator<UClass> It; It; ++It)
+		// ResolveClassByName accepts "BP_Foo", "BP_Foo_C", and "/Game/..." forms and loads unloaded
+		// Blueprints; the raw iterator needed an exact, already-loaded class name (issue #552).
+		UClass* OwnerClass = ResolveClassByName(*ClassName);
+		if (!OwnerClass)
 		{
-			if (It->GetName() == *ClassName)
+			for (TObjectIterator<UClass> It; It; ++It)
 			{
-				OwnerClass = *It;
-				break;
+				if (It->GetName() == *ClassName)
+				{
+					OwnerClass = *It;
+					break;
+				}
 			}
 		}
 
@@ -9125,24 +10514,25 @@ namespace VibeUELayout
 	static float EstimateNodeWidth(const UEdGraphNode* Node);
 }
 
-bool UBlueprintService::BuildGraph(
+FBuildGraphResult UBlueprintService::BuildGraph(
 	const FString& BlueprintPath,
 	const FString& GraphName,
 	const TArray<FGraphNodeDesc>& Nodes,
 	const TArray<FGraphConnectionDesc>& Connections,
 	const TArray<FGraphPinDefaultDesc>& PinDefaults,
 	bool bAutoLayout,
-	bool bCompileAfter,
-	FBuildGraphResult& OutResult)
+	bool bCompileAfter)
 {
-	OutResult = FBuildGraphResult();
+	// Returned by value on every path — a bool + out-param made UE's Python binding hand the
+	// caller None on failure, throwing the diagnostics away (issue #552).
+	FBuildGraphResult OutResult;
 
 	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
 	if (!Blueprint)
 	{
 		OutResult.Errors.Add(FString::Printf(TEXT("Failed to load blueprint: %s"), *BlueprintPath));
 		UE_LOG(LogTemp, Error, TEXT("BuildGraph: Failed to load blueprint: %s"), *BlueprintPath);
-		return false;
+		return OutResult;
 	}
 
 	UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName);
@@ -9154,7 +10544,7 @@ bool UBlueprintService::BuildGraph(
 	{
 		OutResult.Errors.Add(FString::Printf(TEXT("Graph '%s' not found in %s"), *GraphName, *BlueprintPath));
 		UE_LOG(LogTemp, Error, TEXT("BuildGraph: Graph '%s' not found in %s"), *GraphName, *BlueprintPath);
-		return false;
+		return OutResult;
 	}
 
 	// Wrap entire operation in a scoped transaction for Ctrl+Z undo
@@ -9192,6 +10582,65 @@ bool UBlueprintService::BuildGraph(
 			OutResult.Errors.Add(FString::Printf(TEXT("Duplicate ref '%s' at index %d"), *Desc.Ref, i));
 			OutResult.NodesFailed++;
 			continue;
+		}
+
+		// "existing":"true" descriptors (function_entry / function_result from GetGraphDefinition)
+		// are BOUND to the node already in the graph, not created — this is what lets a dumped
+		// function graph round-trip with its parameter/return wiring intact.
+		if (const FString* ExistingFlag = Desc.Params.Find(TEXT("existing")))
+		{
+			if (ExistingFlag->Equals(TEXT("true"), ESearchCase::IgnoreCase))
+			{
+				UEdGraphNode* Bound = nullptr;
+				if (Desc.Type.Equals(TEXT("function_entry"), ESearchCase::IgnoreCase))
+				{
+					for (UEdGraphNode* N : Graph->Nodes)
+					{
+						if (N && N->IsA<UK2Node_FunctionEntry>()) { Bound = N; break; }
+					}
+				}
+				else if (Desc.Type.Equals(TEXT("function_result"), ESearchCase::IgnoreCase))
+				{
+					// Ref is "result" (index 0) or "result_N" (index N-1).
+					int32 WantIndex = 0;
+					if (!Desc.Ref.Equals(TEXT("result"), ESearchCase::IgnoreCase))
+					{
+						FString NumPart;
+						if (Desc.Ref.Split(TEXT("_"), nullptr, &NumPart))
+						{
+							WantIndex = FMath::Max(0, FCString::Atoi(*NumPart) - 1);
+						}
+					}
+					int32 Seen = 0;
+					for (UEdGraphNode* N : Graph->Nodes)
+					{
+						if (N && N->IsA<UK2Node_FunctionResult>())
+						{
+							if (Seen == WantIndex) { Bound = N; break; }
+							++Seen;
+						}
+					}
+				}
+				else
+				{
+					OutResult.Warnings.Add(FString::Printf(TEXT("Node '%s': 'existing' is only supported for function_entry/function_result (got type '%s')"), *Desc.Ref, *Desc.Type));
+					OutResult.NodesFailed++;
+					continue;
+				}
+
+				if (Bound)
+				{
+					RefToNode.Add(Desc.Ref, Bound);
+					OutResult.RefToNodeId.Add(Desc.Ref, Bound->NodeGuid.ToString());
+					UE_LOG(LogTemp, Log, TEXT("BuildGraph: Bound existing %s node → ref '%s' (%s)"), *Desc.Type, *Desc.Ref, *Bound->NodeGuid.ToString());
+				}
+				else
+				{
+					OutResult.Warnings.Add(FString::Printf(TEXT("Node '%s': no existing %s node found in graph to bind"), *Desc.Ref, *Desc.Type));
+					OutResult.NodesFailed++;
+				}
+				continue;
+			}
 		}
 
 		// Place in a grid if auto-layout is on (positions will be overwritten)
@@ -9349,13 +10798,40 @@ bool UBlueprintService::BuildGraph(
 			continue;
 		}
 
-		if (Schema)
+		// Class/object reference pins store their default in Pin->DefaultObject, which
+		// TrySetDefaultValue cannot write — route them through the shared ApplyPinDefault helper
+		// (same path SetNodePinValue uses) so a default like {"ActorClass":"/Script/Engine.StaticMeshActor"}
+		// or a Blueprint class path actually lands (issue #552 follow-up).
+		FString PinDefaultError;
+		const EApplyPinDefaultResult ClassObjResult = ApplyPinDefault(Pin, PinDefault.Value, PinDefaultError);
+		if (ClassObjResult == EApplyPinDefaultResult::Failed)
 		{
-			Schema->TrySetDefaultValue(*Pin, PinDefault.Value);
+			OutResult.Warnings.Add(FString::Printf(TEXT("PinDefault %d: %s (pin '%s' on '%s')"),
+				i, *PinDefaultError, *PinDefault.PinName, *PinDefault.NodeRef));
+			OutResult.DefaultsFailed++;
+			continue;
 		}
-		else
+		if (ClassObjResult == EApplyPinDefaultResult::NotApplicable)
 		{
-			Pin->DefaultValue = PinDefault.Value;
+			if (Schema)
+			{
+				// Silent-drop guard (issue #373 pattern, applied to batch defaults for issue #552):
+				// TrySetDefaultValue can refuse a value without returning false through this path, so
+				// verify the write landed instead of counting it as set.
+				const FString PreviousDefault = Pin->DefaultValue;
+				Schema->TrySetDefaultValue(*Pin, PinDefault.Value);
+				if (Pin->DefaultValue == PreviousDefault && Pin->DefaultValue != PinDefault.Value && !PinDefault.Value.IsEmpty())
+				{
+					OutResult.Warnings.Add(FString::Printf(TEXT("PinDefault %d: Schema dropped value '%s' for pin '%s' on '%s' (type mismatch?)"),
+						i, *PinDefault.Value, *PinDefault.PinName, *PinDefault.NodeRef));
+					OutResult.DefaultsFailed++;
+					continue;
+				}
+			}
+			else
+			{
+				Pin->DefaultValue = PinDefault.Value;
+			}
 		}
 
 		OutResult.DefaultsSet++;
@@ -9412,21 +10888,13 @@ bool UBlueprintService::BuildGraph(
 		OutResult.CompileErrors = CompileResults.NumErrors;
 		OutResult.CompileWarnings = CompileResults.NumWarnings;
 
-		for (const TSharedRef<FTokenizedMessage>& Msg : CompileResults.Messages)
-		{
-			const FString MsgText = Msg->ToText().ToString();
-			if (Msg->GetSeverity() == EMessageSeverity::Error)
-			{
-				OutResult.Errors.Add(FString::Printf(TEXT("Compile: %s"), *MsgText));
-			}
-			else if (Msg->GetSeverity() == EMessageSeverity::Warning || Msg->GetSeverity() == EMessageSeverity::PerformanceWarning)
-			{
-				OutResult.Warnings.Add(FString::Printf(TEXT("Compile: %s"), *MsgText));
-			}
-		}
+		HarvestCompilerMessages(CompileResults, TEXT("Compile: "), OutResult.Errors, OutResult.Warnings);
 	}
 
-	OutResult.bSuccess = (OutResult.NodesFailed == 0 && OutResult.CompileErrors == 0);
+	// Connection/default failures count too now that the full result always reaches the caller —
+	// success means "everything you asked for happened" (issue #552).
+	OutResult.bSuccess = (OutResult.NodesFailed == 0 && OutResult.ConnectionsFailed == 0 &&
+		OutResult.DefaultsFailed == 0 && OutResult.CompileErrors == 0);
 
 	UE_LOG(LogTemp, Log, TEXT("BuildGraph: Complete — %d/%d nodes, %d/%d connections, %d/%d defaults. Success: %s"),
 		OutResult.NodesCreated, Nodes.Num(),
@@ -9434,7 +10902,41 @@ bool UBlueprintService::BuildGraph(
 		OutResult.DefaultsSet, PinDefaults.Num(),
 		OutResult.bSuccess ? TEXT("true") : TEXT("false"));
 
-	return OutResult.bSuccess;
+	return OutResult;
+}
+
+// ────────────────────────────────────────────────────────────────
+// CompileBlueprint — compile and return the harvested error/warning text (issue: no compile API
+// returned the compiler's messages; FBlueprintCompileResult was declared but never used).
+// ────────────────────────────────────────────────────────────────
+FBlueprintCompileResult UBlueprintService::CompileBlueprint(const FString& BlueprintPath)
+{
+	FBlueprintCompileResult Result;
+
+	UBlueprint* Blueprint = LoadBlueprint(BlueprintPath);
+	if (!Blueprint)
+	{
+		Result.bSuccess = false;
+		Result.NumErrors = 1;
+		Result.Errors.Add(FString::Printf(TEXT("Failed to load blueprint: %s"), *BlueprintPath));
+		UE_LOG(LogTemp, Error, TEXT("CompileBlueprint: Failed to load blueprint: %s"), *BlueprintPath);
+		return Result;
+	}
+
+	FCompilerResultsLog CompileResults;
+	CompileResults.bSilentMode = false;
+	CompileResults.bLogInfoOnly = false;
+	FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::None, &CompileResults);
+
+	Result.NumErrors = CompileResults.NumErrors;
+	Result.NumWarnings = CompileResults.NumWarnings;
+	HarvestCompilerMessages(CompileResults, FString(), Result.Errors, Result.Warnings);
+	Result.bSuccess = (CompileResults.NumErrors == 0);
+
+	UE_LOG(LogTemp, Log, TEXT("CompileBlueprint: %s — %d error(s), %d warning(s). Success: %s"),
+		*BlueprintPath, Result.NumErrors, Result.NumWarnings, Result.bSuccess ? TEXT("true") : TEXT("false"));
+
+	return Result;
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -10430,6 +11932,7 @@ bool UBlueprintService::GetGraphDefinition(
 	// Build node → ref map
 	TMap<UEdGraphNode*, FString> NodeToRef;
 	int32 UnnamedIdx = 0;
+	int32 ResultIdx = 0; // distinguishes multiple UK2Node_FunctionResult nodes: result, result_2, ...
 
 	for (UEdGraphNode* Node : Graph->Nodes)
 	{
@@ -10543,10 +12046,22 @@ bool UBlueprintService::GetGraphDefinition(
 			Desc.Params.Add(TEXT("function"), CreateDelegateNode->SelectedFunctionName.ToString());
 			Desc.Ref = FString::Printf(TEXT("CreateDelegate_%d"), UnnamedIdx++);
 		}
-		else if (Node->IsA<UK2Node_FunctionEntry>() || Node->IsA<UK2Node_FunctionResult>())
+		else if (Node->IsA<UK2Node_FunctionEntry>())
 		{
-			// Function entry/result — skip, these are auto-created
-			continue;
+			// Emit the function entry as an EXISTING node (build_graph binds it, does not create it),
+			// so a dumped function graph keeps its parameter wiring and can round-trip as a rollback.
+			Desc.Type = TEXT("function_entry");
+			Desc.Params.Add(TEXT("existing"), TEXT("true"));
+			Desc.Ref = TEXT("entry");
+		}
+		else if (Node->IsA<UK2Node_FunctionResult>())
+		{
+			// Emit the function result node(s) as EXISTING nodes. Reserved refs: "result", then
+			// "result_2", "result_3", ... when a graph has more than one result terminal.
+			Desc.Type = TEXT("function_result");
+			Desc.Params.Add(TEXT("existing"), TEXT("true"));
+			Desc.Ref = (ResultIdx == 0) ? FString(TEXT("result")) : FString::Printf(TEXT("result_%d"), ResultIdx + 1);
+			++ResultIdx;
 		}
 		else
 		{

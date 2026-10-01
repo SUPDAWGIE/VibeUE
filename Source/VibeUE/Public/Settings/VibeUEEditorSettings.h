@@ -22,15 +22,6 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "API", meta = (DisplayName = "API Key", PasswordField = true))
 	FString ApiKey;
 
-	/**
-	 * Save every dirty package before each execute_python_code call. Off by default: several
-	 * tool-driven sessions can share one editor, and a blanket save writes their unsaved work
-	 * (and assets a call created before its caller declared them) to disk. Callers save the
-	 * packages they touched explicitly.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Python", meta = (DisplayName = "Auto-save Dirty Packages Before Python"))
-	bool bAutoSaveDirtyPackagesBeforePython = false;
-
 	//~ Place the settings panel under Editor Preferences > Plugins > VibeUE
 	virtual FName GetContainerName() const override { return TEXT("Editor"); }
 	virtual FName GetCategoryName() const override { return TEXT("Plugins"); }

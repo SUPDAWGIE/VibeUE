@@ -55,6 +55,11 @@ struct FBlueprintGraphInfo
 	/** Number of nodes in this graph (cheap to compute, useful as a sanity signal) */
 	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
 	int32 NodeCount = 0;
+
+	/** Full object path of the graph (Graph->GetPathName()) — unique even when several graphs
+	 *  share a GraphName. Pass it back to any GraphName parameter to disambiguate duplicates. */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	FString GraphPath;
 };
 
 /**
@@ -207,6 +212,37 @@ struct FBlueprintFunctionParameterInfo
 
 	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
 	FString DefaultValue;
+};
+
+/**
+ * Information about a single Timeline on a Blueprint. Returned by get_timelines.
+ * (Replaces the earlier FBlueprintFunctionParameterInfo overload that carried the timeline
+ * name in parameter_name — read the fields below by name instead.)
+ */
+USTRUCT(BlueprintType)
+struct FBlueprintTimelineInfo
+{
+	GENERATED_BODY()
+
+	/** Timeline (component variable) name */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	FString TimelineName;
+
+	/** Total number of tracks (float + vector + color + event) */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	int32 TrackCount = 0;
+
+	/** Timeline length in seconds */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	float Length = 0.0f;
+
+	/** Whether the timeline loops */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	bool bLoop = false;
+
+	/** Whether the timeline auto-plays */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	bool bAutoPlay = false;
 };
 
 /**
@@ -548,6 +584,12 @@ struct FBlueprintPinInfo
 
 	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
 	FString DefaultValue;
+
+	/** Object/class default value as an object path; empty when the pin holds no object/class
+	 *  default. Populated for PC_Object/PC_Class/PC_SoftObject/PC_SoftClass pins so get_node_pins
+	 *  can report class/object references that the string-only DefaultValue does not capture. */
+	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
+	FString DefaultObject;
 };
 
 /**
@@ -920,6 +962,12 @@ struct FGraphNodeDesc
 	 *   event, custom_event, branch, cast, print_string,
 	 *   input_action, math, comparison, delegate_bind,
 	 *   create_event, validated_get, member_get, create_delegate
+	 *
+	 * The pre-existing function terminals are addressed as EXISTING nodes rather than
+	 * created: type "function_entry" (ref "entry") and "function_result" (ref "result",
+	 * "result_2", ...), each carrying params["existing"]="true". GetGraphDefinition emits
+	 * them so a dumped function graph round-trips with its parameter/return wiring; BuildGraph
+	 * binds them to the graph's own entry/result nodes instead of spawning new ones.
 	 */
 	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
 	FString Type;
@@ -929,6 +977,8 @@ struct FGraphNodeDesc
 	 * Any node type also accepts an optional "group":"<title>" layout hint — after
 	 * BuildGraph's auto-layout phase, each distinct title becomes a comment box
 	 * wrapping its member nodes (GUID returned in RefToNodeId under "group:<title>").
+	 * "existing":"true" marks a descriptor that BuildGraph resolves to a node already in
+	 * the graph (used for function_entry/function_result) rather than creating a new one.
 	 */
 	UPROPERTY(BlueprintReadWrite, Category = "Blueprint")
 	TMap<FString, FString> Params;
@@ -1062,7 +1112,10 @@ public:
 	/**
 	 * Get comprehensive blueprint information.
 	 *
-	 * @param BlueprintPath - Full path to the blueprint (e.g., "/Game/Blueprints/BP_Player_Test")
+	 * @param BlueprintPath - Full path to the blueprint (e.g., "/Game/Blueprints/BP_Player_Test").
+	 *   A map/world path (e.g., "/Game/Maps/MainMenu") resolves to that level's Level Blueprint —
+	 *   this applies to EVERY BlueprintService function that takes a BlueprintPath, so level
+	 *   scripts can be inspected and edited like any other Blueprint.
 	 * @param OutInfo - Structure containing all blueprint details (C++ only)
 	 * @return True if successful, false if blueprint not found or invalid
 	 *
@@ -1407,6 +1460,10 @@ public:
 	 * @param DefaultValue - Optional default value as a string
 	 * @param bIsArray - Make it an array of VariableType
 	 * @param ContainerType - "", "Array", "Set", or "Map" (overrides bIsArray when set)
+	 * @param bInstanceEditable - When true, the variable is editable per placed instance in the
+	 *                            Details panel (clears CPF_DisableEditOnInstance). Defaults to false
+	 *                            to preserve the historical blueprint-only behaviour. Flip an existing
+	 *                            variable later with set_variable_instance_editable.
 	 * @return True if the variable was added
 	 *
 	 * Example:
@@ -1421,7 +1478,61 @@ public:
 		const FString& VariableType,
 		const FString& DefaultValue = TEXT(""),
 		bool bIsArray = false,
-		const FString& ContainerType = TEXT(""));
+		const FString& ContainerType = TEXT(""),
+		bool bInstanceEditable = false);
+
+	/**
+	 * Toggle whether an existing member variable is editable per placed instance in the Details
+	 * panel. This flips CPF_DisableEditOnInstance on the variable's PropertyFlags — the flag
+	 * add_member_variable used to hard-code, which left every placed actor stuck on the class
+	 * default ("cannot be edited on instances").
+	 *
+	 * Operates on the Blueprint's OWN variables (NewVariables). Returns False when the variable
+	 * does not exist on this Blueprint.
+	 *
+	 * @param BlueprintPath - Full path to the blueprint
+	 * @param VariableName - Name of the member variable
+	 * @param bInstanceEditable - True = instance-editable (clears CPF_DisableEditOnInstance),
+	 *                            False = blueprint-only (sets CPF_DisableEditOnInstance)
+	 * @return True if the variable was found and its flag updated
+	 *
+	 * Example:
+	 *   unreal.BlueprintService.set_variable_instance_editable("/Game/BP_Window", "YawOffset", True)
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints")
+	static bool SetVariableInstanceEditable(
+		const FString& BlueprintPath,
+		const FString& VariableName,
+		bool bInstanceEditable);
+
+	/**
+	 * Remove a single member variable from a Blueprint by name.
+	 *
+	 * The engine exposes no targeted variable delete to Python — only
+	 * `BlueprintEditorLibrary.remove_unused_variables`, which sweeps EVERY unreferenced variable.
+	 * This removes exactly one, and only that one. It first counts references across ALL graphs
+	 * (Get and Set nodes for this Blueprint's own variable):
+	 *   - references present and bForce false -> refuse (Warning), listing the graphs and node counts;
+	 *   - bForce true -> `FBlueprintEditorUtils::RemoveMemberVariable` removes the variable and its
+	 *     referencing nodes.
+	 * A name that is a component from the Simple Construction Script is refused with a pointer to the
+	 * component API (it is not a NewVariables member). Verifies by readback and returns true only when
+	 * the variable is confirmed gone.
+	 *
+	 * @param BlueprintPath - Full path to the blueprint
+	 * @param VariableName - Name of the member variable to remove
+	 * @param bForce - Remove even when referenced (its Get/Set nodes are removed too)
+	 * @return True only if the variable is confirmed removed
+	 *
+	 * Example:
+	 *   unreal.BlueprintService.remove_member_variable("/Game/BP_Player", "UnusedScratch")
+	 *   unreal.BlueprintService.remove_member_variable("/Game/BP_Player", "OldHealth", True)  # force
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints")
+	static bool RemoveMemberVariable(
+		const FString& BlueprintPath,
+		const FString& VariableName,
+		bool bForce = false);
 
 	/**
 	 * Set the default value of an existing variable.
@@ -2182,7 +2293,12 @@ public:
 	 * @param bLoop - Whether the timeline loops
 	 * @param PosX - X position in the graph
 	 * @param PosY - Y position in the graph
-	 * @return Node ID (GUID) of the Timeline node, empty string on failure
+	 * @param bReplaceExisting - When a UTimelineTemplate with this name already exists (a deleted
+	 *                           Timeline node can leave its template behind), true removes it first
+	 *                           via remove_timeline and re-adds; false (default) refuses and returns
+	 *                           an "ERROR: ..." sentinel string naming the timeline.
+	 * @return Node ID (GUID) of the Timeline node on success; empty string on load/graph failure;
+	 *         a string starting with "ERROR:" when the name is taken and bReplaceExisting is false
 	 *
 	 * Example:
 	 *   node_id = unreal.BlueprintService.add_timeline("/Game/StateTree/BP_Cube", "EventGraph", "LookAtTimeline", 0.5)
@@ -2197,7 +2313,8 @@ public:
 		bool bAutoPlay = false,
 		bool bLoop = false,
 		float PosX = 0.0f,
-		float PosY = 0.0f
+		float PosY = 0.0f,
+		bool bReplaceExisting = false
 	);
 
 	/**
@@ -2245,17 +2362,17 @@ public:
 	);
 
 	/**
-	 * List the timelines on a blueprint, with their float track names.
+	 * List the timelines on a blueprint.
 	 *
 	 * @param BlueprintPath - Full path to the blueprint
-	 * @return Array of "TimelineName" entries; each entry's ParameterType lists comma-separated float track names
+	 * @return Array of FBlueprintTimelineInfo (timeline_name, track_count, length, loop, auto_play)
 	 *
 	 * Example:
 	 *   for t in unreal.BlueprintService.get_timelines("/Game/StateTree/BP_Cube"):
-	 *       print(t.parameter_name, "tracks:", t.parameter_type)
+	 *       print(t.timeline_name, "tracks:", t.track_count, "len:", t.length)
 	 */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints")
-	static TArray<FBlueprintFunctionParameterInfo> GetTimelines(
+	static TArray<FBlueprintTimelineInfo> GetTimelines(
 		const FString& BlueprintPath
 	);
 
@@ -2826,6 +2943,10 @@ public:
 	 *
 	 * Example:
 	 *   unreal.BlueprintService.set_property("/Game/BP_Player", "Health", "150.0")
+	 *
+	 * UE 5.3+ GameplayEffect compatibility:
+	 *   InheritableGameplayEffectTags and InheritableOwnedTagsContainer are persisted through
+	 *   their AssetTags and TargetTags GameplayEffect Components, respectively.
 	 */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints")
 	static bool SetProperty(
@@ -3304,6 +3425,10 @@ public:
 	 * Connections referencing failed nodes are skipped.
 	 * The graph is left in a valid state regardless of partial failures.
 	 *
+	 * Always returns the full FBuildGraphResult — on partial failure inspect .errors, .warnings,
+	 * .nodes_failed etc. (Returning bool + out-param made UE's Python binding fold the result away
+	 * to None on any failure, discarding the diagnostics — issue #552.)
+	 *
 	 * Python Usage:
 	 *   result = unreal.BlueprintService.build_graph(
 	 *       "/Game/BP_Player", "EventGraph",
@@ -3312,21 +3437,35 @@ public:
 	 *       [{"from_":"BeginPlay.then", "to":"Print.execute"}],
 	 *       [{"node_ref":"Print", "pin_name":"InString", "value":"Hello!"}],
 	 *       True, True)
+	 *   if not result.success: print(result.errors, result.warnings)
 	 *
 	 *   Note: Connection refs can be local refs (from Nodes array) or existing node GUIDs.
 	 *   Note: Use "from_" (with underscore) because "from" is a Python reserved keyword.
 	 */
 	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints|BatchGraph")
-	static bool BuildGraph(
+	static FBuildGraphResult BuildGraph(
 		const FString& BlueprintPath,
 		const FString& GraphName,
 		const TArray<FGraphNodeDesc>& Nodes,
 		const TArray<FGraphConnectionDesc>& Connections,
 		const TArray<FGraphPinDefaultDesc>& PinDefaults,
 		bool bAutoLayout,
-		bool bCompileAfter,
-		FBuildGraphResult& OutResult
+		bool bCompileAfter
 	);
+
+	/**
+	 * Compile a blueprint and return the full result — success flag, error/warning counts,
+	 * and the harvested error/warning message text. This is the only compile entry point that
+	 * hands back the compiler's error strings (build_graph only returns them when it happens to
+	 * compile); use it to validate a hand-edited graph or to read why a compile failed.
+	 *
+	 * Python Usage:
+	 *   result = unreal.BlueprintService.compile_blueprint("/Game/BP_Player")
+	 *   if not result.success:
+	 *       print(result.num_errors, result.errors)
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints|BatchGraph")
+	static FBlueprintCompileResult CompileBlueprint(const FString& BlueprintPath);
 
 	/**
 	 * Auto-layout all nodes in an existing graph.
@@ -3447,6 +3586,47 @@ public:
 		const FString& BlueprintPath,
 		const FString& InterfacePath
 	);
+
+	/**
+	 * Refresh the open Blueprint editor for a Blueprint so its SCS viewport re-runs the
+	 * construction script and its graphs redraw. Use after authoring changes that the open editor
+	 * does not reflect live. Returns False when the Blueprint has no editor open (there is nothing
+	 * to refresh — the on-disk asset is already up to date).
+	 *
+	 * @param BlueprintPath - Full path to the blueprint
+	 * @return True if an editor was open and was refreshed
+	 *
+	 * Example:
+	 *   unreal.BlueprintService.refresh_blueprint_editor("/Game/Props/BP_Refrigerator")
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints")
+	static bool RefreshBlueprintEditor(const FString& BlueprintPath);
+
+	/**
+	 * Create a NEW function graph on a Blueprint. This is the counterpart to override_function,
+	 * which can only override a function that already exists on a parent or an implemented
+	 * interface. Works on a normal Blueprint and on a Blueprint Interface — and on an interface it
+	 * is the only way to define anything at all, since a BPI is nothing but its function graphs.
+	 *
+	 * Add parameters and return values afterwards with add_function_parameter (pass is_output=True
+	 * for a return value).
+	 *
+	 * Refuses, returning "": an empty or non-identifier name; a name already used by any graph on
+	 * this Blueprint; and a name that already exists on the parent hierarchy (that is
+	 * override_function's job — creating a shadowing graph would be a duplicate-function compile
+	 * error).
+	 *
+	 * @param BlueprintPath - Full path to the Blueprint or Blueprint Interface
+	 * @param FunctionName  - New function name (letters, digits, underscore; must not start with a digit)
+	 * @param bIsPure       - Create it as a pure function (no exec pins)
+	 * @return The created graph's name, or "" on failure
+	 *
+	 * Example:
+	 *   unreal.BlueprintService.create_function_graph("/Game/AI/BPI_Interactable", "GetDisplayName")
+	 *   unreal.BlueprintService.add_function_parameter("/Game/AI/BPI_Interactable", "GetDisplayName", "Name", "string", True)
+	 */
+	UFUNCTION(BlueprintCallable, meta = (AICallable), Category = "VibeUE|Blueprints")
+	static FString CreateFunctionGraph(const FString& BlueprintPath, const FString& FunctionName, bool bIsPure = false);
 
 private:
 	/** Helper to load blueprint from path */

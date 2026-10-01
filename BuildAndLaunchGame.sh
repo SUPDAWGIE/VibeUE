@@ -18,10 +18,13 @@ Options:
   --clean              Remove project and plugin build artifacts before building.
   --strict-rebuild     Remove this plugin's build artifacts before building.
   --skip-build         Launch without building.
+  --map PATH           Map to open on launch (e.g. /Game/Maps/TrainingPool). Without it the
+                       editor opens the project default map (issue #554).
   -h, --help           Show this help.
 EOF
 }
 
+map=""
 while (($#)); do
     case "$1" in
         --engine) engine_root="$2"; shift 2 ;;
@@ -29,6 +32,7 @@ while (($#)); do
         --clean) clean=true; shift ;;
         --strict-rebuild) strict_rebuild=true; shift ;;
         --skip-build) skip_build=true; shift ;;
+        --map) map="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -82,6 +86,18 @@ fi
 
 project_root="$(dirname -- "$project_path")"
 project_name="$(basename -- "${project_path%.uproject}")"
+build_manifest="$project_root/Saved/VibeUE/last-build.json"
+
+write_build_manifest() {
+    local status="$1" exit_code="${2:-null}" diagnostic="${3:-}"
+    mkdir -p -- "$(dirname -- "$build_manifest")"
+    local completed="null"
+    [[ "$status" == "succeeded" || "$status" == "failed" || "$status" == "skipped" ]] && completed="\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+    local temp="$build_manifest.tmp"
+    printf '{"schema":"vibeue.build.v1","status":"%s","projectFile":"%s","engineRoot":"%s","target":"%sEditor","platform":"%s","configuration":"%s","completedAtIso":%s,"exitCode":%s,"verdict":"%s","logPath":"","diagnostic":"%s"}\n' \
+        "$status" "$project_path" "$engine_root" "$project_name" "$platform" "$mode" "$completed" "$exit_code" "$status" "$diagnostic" > "$temp"
+    mv -f -- "$temp" "$build_manifest"
+}
 
 stop_editor() {
     local pids
@@ -127,7 +143,29 @@ elif [[ "$strict_rebuild" == true ]]; then
 fi
 
 if [[ "$skip_build" == false ]]; then
-    "$build_script" "${project_name}Editor" "$platform" "$mode" "$project_path" -waitmutex
+    write_build_manifest running null
+    if "$build_script" "${project_name}Editor" "$platform" "$mode" "$project_path" -waitmutex; then
+        write_build_manifest succeeded 0
+    else
+        code=$?
+        write_build_manifest failed "$code" "UnrealBuildTool returned a non-zero exit code."
+        exit "$code"
+    fi
+else
+    write_build_manifest skipped null "Build was skipped by caller; this is not compile verification."
 fi
 
-exec "$editor_bin" "$project_path"
+if [[ -n "$map" ]]; then
+    "$editor_bin" "$project_path" "$map" &
+else
+    "$editor_bin" "$project_path" &
+fi
+editor_pid=$!
+
+# Same stale-signal guard as BuildAndLaunchGame.ps1: a crashed Editor can leave a readiness signal
+# named for a PID the OS later reuses, and RegisterToolsets() only clears it late in startup.
+rm -f -- "$project_root/Saved/VibeUE/Signals/editor-$editor_pid-"*.json* 2>/dev/null || true
+
+echo "Editor-PID=$editor_pid"
+
+wait "$editor_pid"

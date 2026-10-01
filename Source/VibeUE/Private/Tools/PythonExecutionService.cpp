@@ -2,8 +2,10 @@
 
 #include "Tools/PythonExecutionService.h"
 #include "Core/ErrorCodes.h"
+#include "Utils/VibeUEPythonResultLog.h"
 #include "Misc/DateTime.h"
 #include "HAL/PlatformMisc.h"
+#include "HAL/PlatformProcess.h"
 #include "Internationalization/Regex.h"
 
 // For SEH exception handling on Windows
@@ -84,7 +86,133 @@ static FSEHExecutionResult ExecutePythonWithSEH(IPythonScriptPlugin* PythonPlugi
 }
 #endif
 
-// Dangerous patterns that can crash the editor
+// Strip Python comments (text after an unquoted '#' to end of line) so guards below are not
+// defeated by a '#' anywhere in the script. Simple scan: track single/double quotes (honouring
+// backslash escapes) and reset at each newline; a '#' seen outside a string ends that line.
+static FString StripPythonComments(const FString& Code)
+{
+	FString Out;
+	Out.Reserve(Code.Len());
+	bool bInSingle = false;
+	bool bInDouble = false;
+	bool bInComment = false;
+	for (int32 i = 0; i < Code.Len(); ++i)
+	{
+		const TCHAR C = Code[i];
+		if (C == TEXT('\n'))
+		{
+			bInSingle = false;
+			bInDouble = false;
+			bInComment = false;
+			Out.AppendChar(C);
+			continue;
+		}
+		if (bInComment)
+		{
+			continue;
+		}
+		if (bInSingle || bInDouble)
+		{
+			// Skip an escaped character so a \' or \" does not flip the quote state.
+			if (C == TEXT('\\') && (i + 1) < Code.Len() && Code[i + 1] != TEXT('\n'))
+			{
+				Out.AppendChar(C);
+				Out.AppendChar(Code[i + 1]);
+				++i;
+				continue;
+			}
+			if (bInSingle && C == TEXT('\'')) { bInSingle = false; }
+			else if (bInDouble && C == TEXT('"')) { bInDouble = false; }
+		}
+		else
+		{
+			if (C == TEXT('#')) { bInComment = true; continue; }
+			if (C == TEXT('\'')) { bInSingle = true; }
+			else if (C == TEXT('"')) { bInDouble = true; }
+		}
+		Out.AppendChar(C);
+	}
+	return Out;
+}
+
+// Blank the CONTENTS of every Python string literal ('...', "...", '''...''', """...""") while
+// keeping the surrounding quote characters and the overall line/column shape, so a keyword that
+// appears only inside a string or a docstring (e.g. "show_modal" in a doc line, or the word "break"
+// in a message) no longer trips the guards below. Comments should be stripped first (this helper
+// does not treat '#'). Escapes are honoured so a \' or \" inside a string does not end it early.
+static FString StripPythonStringLiterals(const FString& Code)
+{
+	FString Out;
+	Out.Reserve(Code.Len());
+	const int32 Len = Code.Len();
+	int32 i = 0;
+	while (i < Len)
+	{
+		const TCHAR C = Code[i];
+
+		// Triple-quoted string ('''...''' or """...""") — may span lines.
+		if ((C == TEXT('\'') || C == TEXT('"')) && (i + 2) < Len && Code[i + 1] == C && Code[i + 2] == C)
+		{
+			const TCHAR Q = C;
+			Out.AppendChar(Q); Out.AppendChar(Q); Out.AppendChar(Q);
+			i += 3;
+			while (i < Len)
+			{
+				if (Code[i] == TEXT('\\') && (i + 1) < Len)
+				{
+					// Preserve real newlines to keep line counts stable; blank the rest.
+					Out.AppendChar(Code[i] == TEXT('\n') ? TEXT('\n') : TEXT(' '));
+					Out.AppendChar(Code[i + 1] == TEXT('\n') ? TEXT('\n') : TEXT(' '));
+					i += 2;
+					continue;
+				}
+				if ((i + 2) < Len && Code[i] == Q && Code[i + 1] == Q && Code[i + 2] == Q)
+				{
+					Out.AppendChar(Q); Out.AppendChar(Q); Out.AppendChar(Q);
+					i += 3;
+					break;
+				}
+				Out.AppendChar(Code[i] == TEXT('\n') ? TEXT('\n') : TEXT(' '));
+				++i;
+			}
+			continue;
+		}
+
+		// Single- or double-quoted string on one line.
+		if (C == TEXT('\'') || C == TEXT('"'))
+		{
+			const TCHAR Q = C;
+			Out.AppendChar(Q);
+			++i;
+			while (i < Len && Code[i] != TEXT('\n'))
+			{
+				if (Code[i] == TEXT('\\') && (i + 1) < Len && Code[i + 1] != TEXT('\n'))
+				{
+					Out.AppendChar(TEXT(' '));
+					Out.AppendChar(TEXT(' '));
+					i += 2;
+					continue;
+				}
+				if (Code[i] == Q)
+				{
+					Out.AppendChar(Q);
+					++i;
+					break;
+				}
+				Out.AppendChar(TEXT(' '));
+				++i;
+			}
+			continue;
+		}
+
+		Out.AppendChar(C);
+		++i;
+	}
+	return Out;
+}
+
+// Dangerous patterns that can crash the editor. Free helper kept for internal use; the public,
+// testable entry point is FPythonExecutionService::ContainsUnsafePattern (declared in the header).
 static bool ContainsDangerousPattern(const FString& Code, FString& OutPattern, FString& OutReason)
 {
 	// EdGraphPinType construction crashes - use BlueprintEditorLibrary.get_basic_type_by_name() instead
@@ -95,71 +223,28 @@ static bool ContainsDangerousPattern(const FString& Code, FString& OutPattern, F
 		return true;
 	}
 	
-	// Direct CDO modification causes crashes — block only when modifying, not reading.
-	// Use regex to detect modification patterns on the CDO result directly (inline or via chained call).
-	// Simple Contains checks are too broad — they fire when set_editor_property or = appear anywhere
-	// in the script, even on unrelated objects.
-	{
-		// Inline: get_default_object(...).set_editor_property(...) on the same line.
-		// Uses [^\n]* to skip nested parens (e.g. get_default_object(bp.generated_class())).
-		//
-		// Matched PER LOGICAL LINE, and an ESCAPED "\n" counts as a separator.
-		//
-		// [^\n]* confines the match to one line only while the subject really contains newline
-		// CHARACTERS, and a large share of traffic does not: the repo's transport wraps every body
-		// as exec(compile(<repr of the code>, ...)), and repr() flattens a whole multi-line script
-		// onto ONE line whose newlines are the two characters backslash-n. Across such a body the
-		// class degenerates into "get_default_object anywhere, then set_editor_property anywhere" —
-		// exactly the too-broad Contains rejected above — and it refused every sanctioned CDO writer
-		// in the project (sup_set_class_defaults, sup_set_nested_property), each of which reads a
-		// CDO on one line and sets a property on another.
-		//
-		// Splitting on the escape as well restores the intended semantics for wrapped and plain
-		// payloads alike. Over-splitting is SAFE in one direction only: a match must fit inside a
-		// single segment, so a finer split can only ever drop a match, never invent one.
-		static FRegexPattern CdoModifyPattern(TEXT("get_default_object\\b[^\\n]*\\.\\s*set_editor_property"));
-		TArray<FString> CodeLines;
-		FString Unflattened = Code.Replace(TEXT("\\n"), TEXT("\n"), ESearchCase::CaseSensitive);
-		Unflattened.ParseIntoArrayLines(CodeLines, /*InCullEmpty=*/false);
-		for (const FString& CodeLine : CodeLines)
-		{
-			FRegexMatcher CdoModifyMatcher(CdoModifyPattern, CodeLine);
-			if (CdoModifyMatcher.FindNext())
-			{
-				OutPattern = TEXT("get_default_object() modification");
-				OutReason = FString::Printf(
-					TEXT("Modifying Class Default Objects (CDOs) from Python causes crashes. Modify instances instead. ")
-					TEXT("[matched 1 of %d line(s), line length %d]"),
-					CodeLines.Num(), CodeLine.Len());
-				return true;
-			}
-		}
-	}
-	
-	// input() blocks the editor indefinitely
-	// Use regex to match standalone input( calls, not method names like add_function_input(
-	// Pattern matches: input(, =input(, (input(, but NOT _input( or identifier_input(
+	// (CDO set_editor_property guard removed: the same-line regex guarded nothing — a chained write
+	// split across two statements passed it — and it blocked the standard, safe way to set Blueprint
+	// defaults from Python, e.g. flipping WaterBodyComponent.affects_landscape before spawning water.)
+
+	// input() blocks the editor indefinitely.
+	// Strip comments first so a '#' anywhere in the script no longer defeats this guard.
+	// The regex matches a bare input( preceded by a non-identifier char (input(, =input(, (input(),
+	// so it already ignores method names ending in _input( such as Enhanced Input's inject_input(.
+	const FString CodeNoComments = StripPythonComments(Code);
 	static FRegexPattern InputPattern(TEXT("(?:^|[^_a-zA-Z0-9])input\\s*\\("));
-	FRegexMatcher InputMatcher(InputPattern, Code);
-	if (InputMatcher.FindNext() && !Code.Contains(TEXT("#")) && !Code.Contains(TEXT("Enhanced")))
+	FRegexMatcher InputMatcher(InputPattern, CodeNoComments);
+	if (InputMatcher.FindNext())
 	{
 		OutPattern = TEXT("input()");
 		OutReason = TEXT("input() blocks the editor. Use a different approach for user interaction.");
 		return true;
 	}
-	
-	// Modal dialogs freeze the editor
-	if (Code.Contains(TEXT("EditorDialog")) || Code.Contains(TEXT("show_modal")))
-	{
-		OutPattern = TEXT("Modal dialogs");
-		OutReason = TEXT("Modal dialogs freeze the editor from Python. Use non-blocking alternatives.");
-		return true;
-	}
-	
+
 	// The legacy MAP CHECK console command crashed the editor's Python interpreter for the whole
-	// editor process (UE 5.8, measured 2026-09-23); no Python-readable result exists anyway.
-	// Matched per logical line for the same reason as the CDO check above: the transport flattens a
-	// body onto one line whose newlines are an escaped backslash-n.
+	// editor process (UE 5.8, measured 2026-09-23); no Python-readable result exists anyway. The
+	// command is itself a string literal, so this runs on the raw code, per logical line: a
+	// transport may flatten the body onto one line whose newlines are an escaped backslash-n.
 	{
 		static FRegexPattern MapCheckPattern(TEXT("CONSOLE_COMMAND\\s*\\(.*[\"']\\s*MAP\\s+CHECK"));
 		TArray<FString> CodeLines;
@@ -176,14 +261,32 @@ static bool ContainsDangerousPattern(const FString& Code, FString& OutPattern, F
 		}
 	}
 
-	// Infinite loops
-	if (Code.Contains(TEXT("while True:")) && !Code.Contains(TEXT("break")))
+	// The remaining guards used to run against the raw source, so a mention of the pattern in a
+	// comment or a docstring/string literal produced a false refusal. Run them against code that has
+	// had both comments AND string-literal contents blanked, so only real code trips them.
+	const FString CodeSanitized = StripPythonStringLiterals(CodeNoComments);
+
+	// Modal dialogs freeze the editor
+	if (CodeSanitized.Contains(TEXT("EditorDialog")) || CodeSanitized.Contains(TEXT("show_modal")))
 	{
-		OutPattern = TEXT("while True without break");
-		OutReason = TEXT("Infinite loops freeze the editor. Ensure your loop has a break condition.");
+		OutPattern = TEXT("Modal dialogs");
+		OutReason = TEXT("Modal dialogs freeze the editor from Python. Use non-blocking alternatives.");
 		return true;
 	}
-	
+
+	// Infinite loops: a `while True:` with no way out. break is the obvious exit, but return, raise
+	// and sys.exit() also leave the loop, so a `while True:` guarded by any of those is not infinite.
+	if (CodeSanitized.Contains(TEXT("while True:")) &&
+		!CodeSanitized.Contains(TEXT("break")) &&
+		!CodeSanitized.Contains(TEXT("return")) &&
+		!CodeSanitized.Contains(TEXT("raise")) &&
+		!CodeSanitized.Contains(TEXT("sys.exit(")))
+	{
+		OutPattern = TEXT("while True without break");
+		OutReason = TEXT("Infinite loops freeze the editor. Ensure your loop has a break/return/raise/sys.exit().");
+		return true;
+	}
+
 	return false;
 }
 
@@ -193,6 +296,11 @@ namespace VibeUE
 FPythonExecutionService::FPythonExecutionService(TSharedPtr<FServiceContext> Context)
 	: FServiceBase(Context)
 {
+}
+
+bool FPythonExecutionService::ContainsUnsafePattern(const FString& Code, FString& OutPattern, FString& OutReason)
+{
+	return ContainsDangerousPattern(Code, OutPattern, OutReason);
 }
 
 TResult<FPythonExecutionResult> FPythonExecutionService::ExecuteCode(
@@ -222,13 +330,18 @@ TResult<FPythonExecutionResult> FPythonExecutionService::ExecuteCode(
 	// Block dangerous patterns that can cause crashes
 	FString BlockedPattern;
 	FString BlockedReason;
-	if (ContainsDangerousPattern(Code, BlockedPattern, BlockedReason))
+	if (ContainsUnsafePattern(Code, BlockedPattern, BlockedReason))
 	{
 		return TResult<FPythonExecutionResult>::Error(
 			ErrorCodes::PYTHON_UNSAFE_CODE,
 			FString::Printf(TEXT("Blocked unsafe Python code: %s. %s"), *BlockedPattern, *BlockedReason)
 		);
 	}
+
+	// Assign this run its per-process id and wall-clock start now, so the outcome can be persisted
+	// (B2) even when the client abandons the call after its timeout while the script keeps running.
+	const int64 RunId = FVibeUEPythonResultLog::NextRunId();
+	const FDateTime StartedUtc = FDateTime::UtcNow();
 
 	// Setup command
 	FPythonCommandEx Command;
@@ -239,6 +352,7 @@ TResult<FPythonExecutionResult> FPythonExecutionService::ExecuteCode(
 
 	// Execute with timing and timeout handling
 	double StartTime = FPlatformTime::Seconds();
+	double ExecutionTimeMs = 0.0; // measured for the main execution (excludes the post-crash probe)
 	bool bSuccess = false;
 	bool bCrashed = false;
 	FString CrashMessage;
@@ -256,6 +370,7 @@ TResult<FPythonExecutionResult> FPythonExecutionService::ExecuteCode(
 #if PLATFORM_WINDOWS
 	// Use SEH helper to catch access violations that C++ try/catch won't handle
 	FSEHExecutionResult SEHResult = ExecutePythonWithSEH(PythonPlugin, &Command);
+	ExecutionTimeMs = (FPlatformTime::Seconds() - StartTime) * 1000.0; // before the probe below
 	bSuccess = SEHResult.bSuccess;
 	if (SEHResult.bCrashed)
 	{
@@ -312,39 +427,69 @@ TResult<FPythonExecutionResult> FPythonExecutionService::ExecuteCode(
 		bCrashed = true;
 		CrashMessage = TEXT("Python execution threw an unhandled exception");
 	}
+	ExecutionTimeMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
 #endif
+
+	const FDateTime FinishedUtc = FDateTime::UtcNow();
+
+	// Build the outcome record once so EVERY completed run is persisted (B2) — including the error
+	// paths, because the code has already run in the editor even when we return an error to a client
+	// that has since timed out. OutErrorCode empty => success.
+	FPythonExecutionResult Result;
+	FString OutErrorCode;
+	FString OutErrorMessage;
 
 	if (bCrashed)
 	{
-		return TResult<FPythonExecutionResult>::Error(
-			ErrorCodes::PYTHON_RUNTIME_ERROR,
-			CrashMessage
-		);
+		Result.bSuccess = false;
+		Result.ErrorMessage = CrashMessage;
+		Result.ExecutionTimeMs = ExecutionTimeMs;
+		// A structured (SEH) exception took down native editor code — NOT the same thing as a Python
+		// traceback. Both used to report PYTHON_RUNTIME_ERROR, which left callers unable to tell them
+		// apart and made UPythonTools suppress the next auto-save after any ordinary exception
+		// (issue #608). Only this path warrants that suspicion.
+		OutErrorCode = ErrorCodes::PYTHON_EDITOR_CRASH;
+		OutErrorMessage = CrashMessage;
+	}
+	else
+	{
+		Result = ConvertExecutionResult(Command, ExecutionTimeMs);
+
+		if (!bSuccess || !Result.bSuccess)
+		{
+			OutErrorCode = ErrorCodes::PYTHON_RUNTIME_ERROR;
+			OutErrorMessage = Result.ErrorMessage.IsEmpty() ? TEXT("Python execution failed") : Result.ErrorMessage;
+		}
+		else if (TimeoutMs > 0 && ExecutionTimeMs > TimeoutMs)
+		{
+			// The script COMPLETED SUCCESSFULLY but ran past the client timeout. This C++ call is
+			// synchronous, so the result is always in hand here — returning PYTHON_EXECUTION_TIMEOUT
+			// (as this path used to) threw away a good result and left a client that is still waiting
+			// (or that retries with a longer budget) with nothing. Return the successful payload
+			// instead, flagged timed_out so the caller knows it overran; run_id + the persisted signal
+			// path travel with the result so vibeue.last_python_result() can recover it too.
+			Result.bTimedOut = true;
+			UE_LOG(LogTemp, Warning,
+				TEXT("Python run #%lld completed in %.2fms, past the %dms timeout — returning the successful result flagged timed_out."),
+				(long long)RunId, ExecutionTimeMs, TimeoutMs);
+		}
 	}
 
-	double ExecutionTimeMs = (FPlatformTime::Seconds() - StartTime) * 1000.0;
+	Result.RunId = RunId;
 
-	// Convert result
-	FPythonExecutionResult Result = ConvertExecutionResult(Command, ExecutionTimeMs);
+	// Persist off the return path. A failure here logs Warning inside Record and never affects the run.
+	FVibeUEPythonResultLog::Record(Result, StartedUtc, FinishedUtc);
 
-	// The timeout can only be measured after the script returns: by then it has run to completion
-	// and any saves it made are on disk. Report the overrun beside the real result instead of
-	// replacing it with an error, so the caller keeps the output that says what was written.
-	Result.TimeoutMs = TimeoutMs;
-	if (TimeoutMs > 0 && ExecutionTimeMs > TimeoutMs)
+	if (!OutErrorCode.IsEmpty())
 	{
-		Result.bTimeoutExceeded = true;
-		UE_LOG(LogTemp, Warning, TEXT("Python execution exceeded %dms timeout (took %.2fms); it ran to completion and its result is returned"),
-			TimeoutMs, ExecutionTimeMs);
-	}
-
-	// Check for errors in result
-	if (!bSuccess || !Result.bSuccess)
-	{
-		return TResult<FPythonExecutionResult>::Error(
-			ErrorCodes::PYTHON_RUNTIME_ERROR,
-			Result.ErrorMessage.IsEmpty() ? TEXT("Python execution failed") : Result.ErrorMessage
-		);
+		// The run has already executed and its outcome is persisted, so even on the error path give the
+		// caller a handle to it: a client that timed out can recover the full result with
+		// vibeue.last_python_result() using the run id and signal file named here.
+		const FString SignalPath = FVibeUEPythonResultLog::GetLastResultPathForPid(FPlatformProcess::GetCurrentProcessId());
+		OutErrorMessage += FString::Printf(
+			TEXT(" (run_id=%lld; result persisted to %s — recover it with vibeue.last_python_result())"),
+			(long long)RunId, *SignalPath);
+		return TResult<FPythonExecutionResult>::Error(OutErrorCode, OutErrorMessage);
 	}
 
 	return TResult<FPythonExecutionResult>::Success(Result);

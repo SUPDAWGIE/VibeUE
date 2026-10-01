@@ -58,9 +58,13 @@ Do **not** call `BlueprintEditorLibrary.get_blueprint_class()`, `unreal.create_w
 ### 🚨 Hierarchy: set the root first, parents before children
 
 ```python
-unreal.WidgetService.add_component(path, "CanvasPanel", "RootCanvas", "", True)   # root: set_as_root=True
+unreal.WidgetService.add_component(path, "CanvasPanel", "RootCanvas", "", True)   # empty parent -> becomes root
 unreal.WidgetService.add_component(path, "Button", "PlayButton", "RootCanvas", False)
 ```
+
+That 5th argument is `is_variable`, **not** `set_as_root` — a widget becomes the root because its parent
+name is empty, not because of that flag. A 6th argument, `child_index`, inserts at a position instead of
+appending; `reorder_component` moves an existing widget within its parent. See `reference.md` ▸ Child order.
 
 > ⚠️ **Widget names are unique per-blueprint, NOT per-parent.** UMG enforces one name across the
 > whole Widget Blueprint, so you can't add an `ItemLabel`/`ItemButton` under each of `Item1`,
@@ -101,12 +105,24 @@ examples in `scripts/apply_font.txt` and `scripts/apply_brush.txt`.
 > via `set_font` with a `WidgetFontInfo`. Don't trust the `True/False` return of `set_property` on
 > nested struct sub-fields — read it back to confirm.
 
+> ✅ **`set_font` colour is now applied** (`ColorAndOpacity` is an `FSlateColor`; the old path
+> silently no-op'd a bare `(R=,G=,B=,A=)` tuple). Pass a LINEAR tuple, e.g. `(R=0.035,G=0.002,B=0.002,A=1)`;
+> `set_font` returns **False** and logs a Warning if a supplied colour did not land, so trust the return.
+
 > ⚠️ **`get_font` readback quirk (issue #470):** the struct-typed string fields `color`,
 > `shadow_color`, and `shadow_offset` come back as **two concatenated representations** glued
 > together, e.g. `shadow_offset == "(X=0.0,Y=0.0)(X=1.000000,Y=1.000000)"`. The *trailing*
 > parenthesized group is the real value. Scalar fields (`size`, `typeface`, `font_family`,
 > `letter_spacing`, `outline_size`) are clean. When verifying a font round-trip, parse the last
 > `(...)` group of these three fields (or compare scalars only) until #470 is fixed.
+
+### 🚨 Override-gated properties (SizeBox width/height etc.)
+
+`set_editor_property("width_override", 34.0)` on a `USizeBox` stores the value but leaves the paired
+`bOverride_WidthOverride` edit-condition flag false — the override silently never applies (the value
+even reads back as 34.0). Call the dedicated setters (`set_width_override()`, `set_height_override()`,
+`set_min_desired_width()`, ...) which set flag + value together. Applies to any widget property gated
+by a `bOverride_*` flag; after a raw property set, read the flag back before trusting the layout.
 
 ### 🚨 Animations require real property paths
 
@@ -117,6 +133,8 @@ then the track, then keyframes. (Runnable: `scripts/create_animation.txt`.)
 ### 🚨 Preview vs PIE — different purposes
 
 - `capture_preview` renders an editor-side PNG without starting gameplay — use for appearance checks.
+  It now renders with a single gamma pass (an sRGB PNG matching the designer, no more double-gamma) and
+  a layout prepass (Overlay-centred content is centred, not bottom-aligned).
 - `start_pie` + `spawn_widget_in_pie` are for runtime state / live property reads — use only when you
   need a live instance.
 
@@ -186,6 +204,13 @@ unreal.WidgetService.set_property(path, "HeaderRow", "Vertical Alignment", "Top"
 unreal.WidgetService.set_property(path, "HeaderRow", "Padding", "8")
 ```
 
+> **Shadowed names prefer the WIDGET (fixed in issue #553).** A name that exists on both a widget
+> and its slot (e.g. `HorizontalAlignment` on a Border sitting in an Overlay) now writes the
+> widget's own property; a log warning notes the ambiguity. To target the slot explicitly, prefix
+> with `Slot.` — e.g. `set_property(path, "BackgroundBorder", "Slot.HorizontalAlignment", "Center")`
+> (value aliases like `Fill`/`Center` still work behind the prefix). Names that exist only as slot
+> aliases (the lists above) keep resolving to the slot with no prefix needed.
+
 ### Reparenting — `reparent_widget`
 
 Move an existing widget to a new parent panel (preserves the widget object/GUID):
@@ -248,3 +273,12 @@ loader that exposes this skill; there is no `vibeue-skills-manager` tool):
 3. Open/compile the WBP and confirm no errors, then `unreal.EditorAssetLibrary.save_asset(path)`.
 
 Never report a widget as created/configured until it appears in a fresh `get_widget_snapshot` result.
+
+## Additional gotchas
+
+- `capture_preview` renders correct gamma/colour now, but still confirm slot values with `get_component_snapshot` and layout in PIE. UMG colours are LINEAR — a dark sRGB red is about (0.035, 0.002, 0.002).
+- Slot values written through `ObjectIterator` are discarded on the next compile; set them with `set_property(path, widget, "Slot.<Prop>", value)` or in C++ `NativeConstruct`.
+- A fresh WBP has no root: the first `add_component(path, type, name, parent_name="")` becomes it. `BindWidget` binds only when the tree widget is `is_variable=True`; reading a bound member from Python is blocked, so enumerate `ObjectIterator(unreal.TextBlock)` filtered by the instance path.
+- `bind_event` is only provably bound on the `GameInstance_*`-outered PIE instance (asset/preview instances always read unbound); simulate a click with `on_clicked.broadcast()` on that instance. Hand-built bound-event nodes compile but never fire — use `create_component_bound_event`.
+- A widget can be fully authored yet never compiled; compile a legacy widget and read the error first. UE 5.8 renamed `WidgetBlueprintLibrary` to `unreal.WidgetLibrary`, and `UserWidget` instances do not expose `get_widget_from_name`.
+- Input modes: a UI-only mode drops the first WASD press after it closes, so use `SetInputMode_GameAndUIEx` in Construct; the input mode survives `ServerTravel`; `DefaultInput.ini` holds a full serialised InputSettings block mid-file, so a key appended at the section top is silently overridden.

@@ -186,15 +186,16 @@ You get the full `unreal.*` API plus every `unreal.<Service>` VibeUE adds. Reser
 **engine toolsets and skills** (e.g. `AgentSkillToolset`, `EditorToolset.EditorAppToolset`,
 `LogsToolset`, `GameplayTagsToolset`, `AssetTools`).
 
-**`auto_save` (default true).** Before running your script, `execute_python_code` saves every dirty
-content AND world package headlessly (issue #433: this avoids the modal save dialog that would hang
-the call). Every reply reports what actually happened: `auto_save` (true only when the sweep really
+**`auto_save` (default false in this fork; upstream defaults to true).** With `auto_save=true`,
+`execute_python_code` saves every dirty content AND world package headlessly before running your
+script (issue #433: this avoids the modal save dialog that would hang the call). The fork turns it off
+by default because several tool sessions share one editor and a blanket save persists their unsaved
+work; save the packages you touched explicitly. Every reply reports what actually happened: `auto_save` (true only when the sweep really
 ran), `auto_save_note` (empty when it ran, otherwise `opted_out`, `previous_run_crashed`,
 `editor_unavailable`, `pie_active`, or `save_failed`) and `saved_packages` (the package names it
 wrote). `auto_save` is the OUTCOME, not an echo of your argument -- so `auto_save: true,
-saved_packages: []` means "swept, nothing was dirty", never "skipped". Pass `auto_save=false` to run
-the script WITHOUT that sweep -- use it when you do not want in-flight editor edits flushed to disk,
-or to keep a mutation you are about to make from being interleaved with an unrelated dirty package.
+saved_packages: []` means "swept, nothing was dirty", never "skipped". Without the argument the
+reply reads `auto_save: false, auto_save_note: opted_out`.
 The sweep is skipped anyway after a crashed run, when GEditor is missing, or in PIE.
 
 ## Never leave a map loaded - it crashes the editor on the next level change

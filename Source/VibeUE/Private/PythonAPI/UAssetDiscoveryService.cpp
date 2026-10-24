@@ -27,6 +27,109 @@
 #include "BlueprintAssetHandler.h"     // A13: engine fallback for a non-Blueprint asset that still owns a UBlueprint
 #include "Engine/Blueprint.h"          // A13: complete UBlueprint type for the UBlueprint* -> UObject* base conversion above
 #include "UObject/GCObject.h"          // A13: UGCObjectReferencer — the native GC root a Python global appears as (refusal signal)
+#include "AssetImportTask.h"           // Meshes and other non-image files through AssetImportTask
+#include "Async/TaskGraphInterfaces.h" // IsThreadProcessingTasks, the RecursionGuard check
+#include "Engine/StaticMesh.h"         // ranking what a multi-asset import returns
+#include "Engine/SkeletalMesh.h"
+#include "Animation/Skeleton.h"
+#include "PhysicsEngine/PhysicsAsset.h"
+#include "Materials/MaterialInterface.h"
+#include "UObject/SoftObjectPath.h"
+#include "HAL/FileManager.h"                // P16: confirm the package file really left the disk
+#include "Editor/Transactor.h"              // P16: UTransactor::GetQueueLength, to report the engine's undo reset
+
+namespace
+{
+	// How likely an imported object is the asset the file IS, for a file that brings several: a mesh first, then
+	// anything else (animations, sounds, data), and last the side assets a mesh import creates next to the mesh
+	// (materials, textures, its skeleton and physics asset).
+	int32 RankImportedObjectForImportAsset(const UObject* Object)
+	{
+		if (!Object)
+		{
+			return 0;
+		}
+		if (Object->IsA<UStaticMesh>() || Object->IsA<USkeletalMesh>())
+		{
+			return 3;
+		}
+		if (Object->IsA<UMaterialInterface>() || Object->IsA<UTexture>() || Object->IsA<USkeleton>() || Object->IsA<UPhysicsAsset>())
+		{
+			return 1;
+		}
+		return 2;
+	}
+
+	// Every non-image format (FBX, OBJ, glTF, ...) goes through Epic's AssetImportTask, run synchronously.
+	// Interchange waits for the import by pumping the game thread's task queue (ProcessThreadUntilIdle), which asserts
+	// (TaskGraph RecursionGuard) only when the caller is itself running as a game-thread task. MCP tool calls and
+	// execute_python_code run from the core ticker, not as a task, so the wait is safe there; a call made from inside a
+	// game-thread task is refused instead of asserting.
+	// bReplaceExisting replaces an asset of the requested name, and also any same-named asset in the folder that a
+	// multi-asset file brings along (an FBX's materials and textures). The names of those are only known once the
+	// importer ran, so there is no pre-check; the asset-management skill tells callers to use a dedicated folder.
+	FString ImportThroughAssetTools(const FString& SourceFilePath, const FString& Folder, const FString& FinalName, FString& OutError)
+	{
+		if (!IsInGameThread())
+		{
+			OutError = TEXT("import_asset must run on the game thread");
+			return FString();
+		}
+
+		if (FTaskGraphInterface::Get().IsThreadProcessingTasks(ENamedThreads::GameThread))
+		{
+			OutError = TEXT("Refused: this call runs inside a game-thread task, where a synchronous import would assert (TaskGraph RecursionGuard). Call import_asset from execute_python_code or a tool call.");
+			return FString();
+		}
+
+		UAssetImportTask* Task = NewObject<UAssetImportTask>();
+		Task->AddToRoot();
+		Task->Filename = SourceFilePath;
+		Task->DestinationPath = Folder;
+		Task->DestinationName = FinalName;
+		Task->bAutomated = true;  // no option dialogs, unattended for the import's scope
+		Task->bReplaceExisting = true;
+		Task->bSave = true;
+		Task->bAsync = false;
+
+		IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+		AssetTools.ImportAssetTasks({ Task });
+
+		const TArray<FString> Imported = Task->ImportedObjectPaths;
+		Task->RemoveFromRoot();
+
+		if (Imported.Num() == 0)
+		{
+			OutError = FString::Printf(TEXT("AssetTools imported nothing from '%s' (unsupported format, or the importer failed: see the Output Log)"), *SourceFilePath);
+			return FString();
+		}
+
+		// A file can bring several assets (an FBX: the mesh plus its materials, textures, skeleton and physics asset), and
+		// the importer does not always give the main one the requested name. Return the asset the file is: the best
+		// ranked, among equals the one named as asked, else the first the importer reported.
+		FString Best;
+		int32 BestRank = -1;
+		bool bBestNamed = false;
+		for (const FString& Path : Imported)
+		{
+			const int32 Rank = RankImportedObjectForImportAsset(FSoftObjectPath(Path).ResolveObject());
+			const bool bNamed = FPackageName::ObjectPathToObjectName(Path) == FinalName;
+			if (Rank > BestRank || (Rank == BestRank && bNamed && !bBestNamed))
+			{
+				Best = Path;
+				BestRank = Rank;
+				bBestNamed = bNamed;
+			}
+		}
+
+		if (!bBestNamed)
+		{
+			UE_LOG(LogTemp, Log, TEXT("UAssetDiscoveryService::ImportAsset: the importer named the main asset '%s', not '%s'"),
+				*FPackageName::ObjectPathToObjectName(Best), *FinalName);
+		}
+		return Best;
+	}
+}
 
 // ========== Texture Operations ==========
 
@@ -95,7 +198,7 @@ FString UAssetDiscoveryService::ImportAsset(
 		return FString();
 	}
 
-	// Only image formats are handled by this fast factory path.
+	// Image formats take the fast texture-factory path; everything else goes through AssetImportTask.
 	const FString Ext = FPaths::GetExtension(SourceFilePath).ToLower();
 	static const TSet<FString> ImageExts = {
 		TEXT("png"), TEXT("jpg"), TEXT("jpeg"), TEXT("bmp"), TEXT("tga"),
@@ -104,15 +207,16 @@ FString UAssetDiscoveryService::ImportAsset(
 	};
 	if (!ImageExts.Contains(Ext))
 	{
-		OutError = FString::Printf(
-			TEXT("Unsupported file type '.%s'. Supported image formats: png, jpg, jpeg, bmp, tga, dds, exr, hdr, tiff, tif, psd, pcx."),
-			*Ext);
-		return FString();
+		const FString Imported = ImportThroughAssetTools(SourceFilePath, Folder, FinalName, OutError);
+		if (!Imported.IsEmpty())
+		{
+			UE_LOG(LogTemp, Log, TEXT("UAssetDiscoveryService::ImportAsset: imported '%s' -> '%s'"), *SourceFilePath, *Imported);
+		}
+		return Imported;
 	}
 
-	// Read the file into memory and feed it straight to the texture factory. We deliberately
-	// avoid IAssetTools::ImportAssets / ImportAssetTasks: those pump the game-thread task graph,
-	// which trips a RecursionGuard assertion when called from inside an MCP tool's AsyncTask.
+	// Read the file into memory and feed it straight to the texture factory (images keep this
+	// path, which saves each texture itself; other formats take AssetImportTask above).
 	TArray<uint8> FileData;
 	if (!FFileHelper::LoadFileToArray(FileData, *SourceFilePath) || FileData.Num() == 0)
 	{
@@ -405,6 +509,23 @@ FUnattendedDeleteResult UAssetDiscoveryService::DeleteAssetUnattended(const FStr
 		return Result;
 	}
 
+	// P16: never delete while an editor transaction is OPEN (a ScopedEditorTransaction block that is
+	// still running). The engine delete below resets the undo history itself whenever undo is an
+	// asset's only holder (ObjectTools.cpp DeleteSingleObject and CleanupAfterSuccessfulDelete call
+	// GEditor->ResetTransaction), and ForceReplaceReferences transacts too; with ActiveCount != 0,
+	// UTransBuffer::Reset cancels the caller's open transaction out from under it. This is refused for
+	// every asset, undo-held or not, before anything is touched.
+	if (GEditor && GEditor->IsTransactionActive())
+	{
+		Result.ErrorCode = TEXT("TRANSACTION_OPEN");
+		Result.ErrorMessage = FString::Printf(
+			TEXT("Refusing to delete %s while an editor transaction is open (a ScopedEditorTransaction block?): the delete ")
+			TEXT("can reset the undo buffer, which would cancel that transaction. Leave the transaction, then retry."),
+			*AssetPath);
+		UE_LOG(LogTemp, Warning, TEXT("UAssetDiscoveryService::DeleteAssetUnattended: %s"), *Result.ErrorMessage);
+		return Result;
+	}
+
 	// Who points at it (the question the modal dialog would have asked the human)
 	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
 	const FString PackageName = FPackageName::ObjectPathToPackageName(AssetPath);
@@ -428,8 +549,12 @@ FUnattendedDeleteResult UAssetDiscoveryService::DeleteAssetUnattended(const FStr
 	// ForceDeleteObjects can still open a read-only-package prompt even when confirmation is
 	// disabled. Preflight the resolved package file so this API keeps its unattended/no-modal
 	// contract instead of wedging the game thread on a source-control or filesystem attribute.
+	//
+	// Whether the package had a file at all is also kept for the post-delete check: an in-memory asset
+	// that was never saved has nothing on disk to remove.
 	FString PackageFilename;
-	if (FPackageName::DoesPackageExist(PackageName, &PackageFilename) &&
+	const bool bFileExistedBefore = FPackageName::DoesPackageExist(PackageName, &PackageFilename);
+	if (bFileExistedBefore &&
 		FPlatformFileManager::Get().GetPlatformFile().IsReadOnly(*PackageFilename))
 	{
 		Result.ErrorMessage = FString::Printf(
@@ -544,10 +669,10 @@ FUnattendedDeleteResult UAssetDiscoveryService::DeleteAssetUnattended(const FStr
 	// Python global it listed only the 2 spawners (deletes fine); an anim sequence listed only its
 	// AnimSequencerController (deletes fine). So the conservative, correct signal is: refuse iff some
 	// external referencer is a UGCObjectReferencer.
+	bool bIsReferencedByUndo = false;
 	{
 		FReferencerInformationList Refs;
 		bool bIsReferenced = false;
-		bool bIsReferencedByUndo = false;
 		ObjectTools::GatherObjectReferencersForDeletion(Asset, bIsReferenced, bIsReferencedByUndo, &Refs);
 
 		TArray<FString> NativeRoots;
@@ -577,6 +702,20 @@ FUnattendedDeleteResult UAssetDiscoveryService::DeleteAssetUnattended(const FStr
 		}
 	}
 
+	// P16: the undo buffer. An asset edited inside a committed editor transaction is held by the undo
+	// history. That alone does not stop the delete: when undo is the asset's ONLY holder the engine's own
+	// delete resets the undo history and deletes it fully (ObjectTools.cpp DeleteSingleObject and
+	// CleanupAfterSuccessfulDelete -> GEditor->ResetTransaction), and it always did so through this
+	// function. So proceed, but say so: the caller loses its undo history. The case that really leaves a
+	// file behind is undo PLUS a second holder (the 2026-10-21 SM_Rails copy): the engine then keeps the
+	// package, and the post-delete file check below reports it as FILE_NOT_REMOVED.
+	const bool bUndoHeld = bIsReferencedByUndo || (GEditor && GEditor->IsObjectInTransactionBuffer(Asset));
+	const int32 UndoQueueLengthBefore = (GEditor && GEditor->Trans) ? GEditor->Trans->GetQueueLength() : 0;
+	if (bUndoHeld)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("delete_asset_unattended: '%s' is in the undo buffer; the engine resets the undo history to delete it"), *AssetPath);
+	}
+
 	// No native root holds it: hand the deletion to the engine's real force delete, exactly as the
 	// pre-A13 code did. ForceDeleteObjects nulls the reflected references itself (on-disk data-asset
 	// pointers etc.), reparents child Blueprints, removes child redirectors / generated classes and
@@ -585,6 +724,28 @@ FUnattendedDeleteResult UAssetDiscoveryService::DeleteAssetUnattended(const FStr
 	TArray<UObject*> Objects;
 	Objects.Add(Asset);
 	const int32 Deleted = ObjectTools::ForceDeleteObjects(Objects, /*bShowConfirmation*/ false);
+
+	// Whether the engine's delete really reset the undo history, measured around ForceDeleteObjects itself so
+	// EVERY return below reports it truthfully, failures included: the reset happens inside the delete
+	// (DeleteSingleObject / CleanupAfterSuccessfulDelete), before the outcome checks. Read from the queue
+	// length, not the asset: the asset may already be garbage-collected here. The Warning above names the
+	// reset in advance; when the queue did not go to 0, the result says what happened instead.
+	const int32 UndoQueueLengthAfter = (GEditor && GEditor->Trans) ? GEditor->Trans->GetQueueLength() : 0;
+	Result.bUndoBufferReset = GEditor && GEditor->Trans && UndoQueueLengthBefore > 0 && UndoQueueLengthAfter == 0;
+	if (Result.bUndoBufferReset)
+	{
+		Result.Message = bUndoHeld
+			? FString(TEXT("The asset was in the undo buffer, and the engine reset the undo history during the delete: earlier edits can no longer be undone."))
+			: FString(TEXT("The engine reset the undo history during the delete: earlier edits can no longer be undone."));
+	}
+	else if (bUndoHeld)
+	{
+		Result.Message = FString::Printf(
+			TEXT("The asset was in the undo buffer, but the engine did NOT reset the undo history (queue length %d before the delete, %d after): ")
+			TEXT("earlier edits are still undoable, and the undo buffer may still hold the asset."),
+			UndoQueueLengthBefore, UndoQueueLengthAfter);
+	}
+
 	if (Deleted <= 0)
 	{
 		Result.ErrorMessage = FString::Printf(TEXT("ForceDeleteObjects returned 0 for %s (system veto; see the log)"), *AssetPath);
@@ -593,7 +754,33 @@ FUnattendedDeleteResult UAssetDiscoveryService::DeleteAssetUnattended(const FStr
 		return Result;
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("UAssetDiscoveryService::DeleteAssetUnattended: deleted %s (%d referencer(s) reported)"), *AssetPath, Result.Referencers.Num());
+	// P16: "deleted" must mean the file is gone too. The engine skips the file of a package something
+	// still holds (CleanupAfterSuccessfulDelete culls referenced packages), and a file left behind brings
+	// the asset back on the next editor start. Check the file resolved BEFORE the delete; a package that
+	// never had one (an in-memory asset that was never saved) is reported as such, not as removed.
+	if (bFileExistedBefore)
+	{
+		if (IFileManager::Get().FileExists(*PackageFilename))
+		{
+			Result.FileStatus = TEXT("still_on_disk");
+			Result.ErrorCode = TEXT("FILE_NOT_REMOVED");
+			Result.ErrorMessage = FString::Printf(
+				TEXT("%s was deleted in memory and from the asset registry, but its package file is still on disk (%s): something ")
+				TEXT("still held the package, and the asset will come back on the next editor start. Delete the file with the editor closed."),
+				*AssetPath, *PackageFilename);
+			UE_LOG(LogTemp, Warning, TEXT("UAssetDiscoveryService::DeleteAssetUnattended: %s"), *Result.ErrorMessage);
+			return Result;
+		}
+		Result.bFileRemoved = true;
+		Result.FileStatus = TEXT("removed");
+	}
+	else
+	{
+		Result.FileStatus = TEXT("never_on_disk");
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("UAssetDiscoveryService::DeleteAssetUnattended: deleted %s (%d referencer(s) reported, file: %s)"),
+		*AssetPath, Result.Referencers.Num(), *Result.FileStatus);
 	Result.bSuccess = true;
 	return Result;
 }

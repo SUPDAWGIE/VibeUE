@@ -32,6 +32,7 @@
 // runtime class lookup (FindObject<UClass> on /Script/NiagaraEditor.NiagaraNode...).
 #include "EdGraphSchema_Niagara.h"
 #include "NiagaraEditorSettings.h"
+#include "NiagaraExternalSystemEditorUtilities.h"
 #include "NiagaraGraph.h"
 #include "NiagaraNodeCustomHlsl.h"
 #include "NiagaraNodeFunctionCall.h"
@@ -246,6 +247,81 @@ namespace
 		return FString();
 	}
 
+	/** UNiagaraNodeWithDynamicPins::IsAddPin is unexported; same check (Misc category, "DynamicAddPin"). */
+	bool IsDynamicAddPin(const UEdGraphPin* Pin)
+	{
+		static const FName AddPinSubCategory(TEXT("DynamicAddPin"));
+		return Pin
+			&& Pin->PinType.PinCategory == UEdGraphSchema_Niagara::PinCategoryMisc
+			&& Pin->PinType.PinSubCategory == AddPinSubCategory;
+	}
+
+	/**
+	 * UEdGraphNode::CreatePin appends, so a pin made on a dynamic-pin node lands AFTER that side's
+	 * "+" add pin. The engine's own RequestNewTypedPin inserts before it, and the stack view relies on
+	 * that: UNiagaraNodeCustomHlsl::BuildParameterMapHistory pairs pin i with Signature.Inputs[i] and
+	 * only skips the add pin, so a real pin behind the add pin reads one past the end of the signature
+	 * ("Array index out of bounds: 4 into an array of size 4" with four inputs). The compiler takes a
+	 * different path and stays green, which is why the crash only shows when a stack view is built
+	 * (opening the system, or GetScriptStackTopology). Move the new pin in front of the add pin.
+	 */
+	void PlacePinBeforeAddPin(UEdGraphNode* Node, UEdGraphPin* NewPin)
+	{
+		if (!Node || !NewPin) return;
+		const int32 NewIndex = Node->Pins.Find(NewPin);
+		if (NewIndex == INDEX_NONE) return;
+		for (int32 i = 0; i < NewIndex; ++i)
+		{
+			const UEdGraphPin* Pin = Node->Pins[i];
+			if (IsDynamicAddPin(Pin) && Pin->Direction == NewPin->Direction)
+			{
+				Node->Pins.RemoveAt(NewIndex);
+				Node->Pins.Insert(NewPin, i);
+				return;
+			}
+		}
+	}
+
+	/** True when, on each side, nothing but other add pins follows the first add pin. */
+	bool HasAddPinsLast(const UEdGraphNode* Node)
+	{
+		bool bSeenAdd[2] = { false, false };
+		for (const UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin) continue;
+			const int32 Side = Pin->Direction == EGPD_Input ? 0 : 1;
+			if (IsDynamicAddPin(Pin))
+			{
+				bSeenAdd[Side] = true;
+			}
+			else if (bSeenAdd[Side])
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/**
+	 * Move every add pin behind the real pins, keeping the real pins' relative order. Pin order
+	 * within a side is all that changes, so links, names and the compiled result stay the same.
+	 * Returns true when the order changed.
+	 */
+	bool MoveAddPinsLast(UEdGraphNode* Node)
+	{
+		if (!Node || HasAddPinsLast(Node)) return false;
+		Node->Modify();
+		TArray<UEdGraphPin*> Real;
+		TArray<UEdGraphPin*> Add;
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			(IsDynamicAddPin(Pin) ? Add : Real).Add(Pin);
+		}
+		Real.Append(Add);
+		Node->Pins = MoveTemp(Real);
+		return true;
+	}
+
 	/**
 	 * Replicate UNiagaraNodeCustomHlsl::RebuildSignatureFromPins (which is protected and not
 	 * exported across modules). We rebuild the function signature from the current pin set
@@ -255,8 +331,8 @@ namespace
 	 * runs RefreshFromExternalChanges → ReallocatePins(false), which rebuilds pins from the
 	 * stale signature and silently wipes any pin that isn't in it yet.
 	 *
-	 * UNiagaraNodeWithDynamicPins::IsAddPin is also unexported, so we open-code the same check
-	 * (Misc category, "DynamicAddPin" subcategory) from NiagaraNodeWithDynamicPins.cpp.
+	 * Signature order follows pin order, so call PlacePinBeforeAddPin first: the stack view pairs
+	 * pins and signature entries by index.
 	 */
 	void RebuildCustomHlslSignatureFromPins(UEdGraphNode* HlslNode)
 	{
@@ -270,14 +346,11 @@ namespace
 		Sig.Inputs.Empty();
 		Sig.Outputs.Empty();
 
-		static const FName AddPinSubCategory(TEXT("DynamicAddPin"));
-
 		for (UEdGraphPin* Pin : HlslNode->Pins)
 		{
 			if (!Pin) continue;
 			// Skip "Add" placeholder pins (the "+" buttons on each side of the node).
-			if (Pin->PinType.PinCategory == UEdGraphSchema_Niagara::PinCategoryMisc
-				&& Pin->PinType.PinSubCategory == AddPinSubCategory)
+			if (IsDynamicAddPin(Pin))
 			{
 				continue;
 			}
@@ -538,6 +611,19 @@ TArray<FString> UNiagaraScratchPadService::ListScratchModules(
 		}
 	}
 	return Out;
+}
+
+TArray<FString> UNiagaraScratchPadService::ListEmitters(const FString& SystemPath)
+{
+	TArray<FString> Names;
+	if (UNiagaraSystem* System = LoadSystem(SystemPath))
+	{
+		for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+		{
+			Names.Add(Handle.GetName().ToString());
+		}
+	}
+	return Names;
 }
 
 // =====================================================================
@@ -860,15 +946,18 @@ FNiagaraScratchResult UNiagaraScratchPadService::AddPin(
 	{
 		const FString Namespaced = NormalizeNamespacedName(PinName, TEXT("Module"));
 		NewPin = Node->CreatePin(EGPD_Output, PinType, FName(*Namespaced));
+		PlacePinBeforeAddPin(Node, NewPin);
 	}
 	else if (IsMapSet(Node))
 	{
 		const FString Namespaced = NormalizeNamespacedName(PinName, TEXT("Output"));
 		NewPin = Node->CreatePin(EGPD_Input, PinType, FName(*Namespaced));
+		PlacePinBeforeAddPin(Node, NewPin);
 	}
 	else if (Node->IsA<UNiagaraNodeCustomHlsl>())
 	{
 		NewPin = Node->CreatePin(Dir, PinType, FName(*PinName));
+		PlacePinBeforeAddPin(Node, NewPin);
 		// Rebuild the script signature so the new pin participates in compilation.
 		// Must NOT route through PostEditChangeProperty - that calls RefreshFromExternalChanges
 		// which calls ReallocatePins(false) which rebuilds pins from the stale signature
@@ -879,6 +968,7 @@ FNiagaraScratchResult UNiagaraScratchPadService::AddPin(
 	{
 		// Generic dynamic-pin node (Op, If, etc.)
 		NewPin = Node->CreatePin(Dir, PinType, FName(*PinName));
+		PlacePinBeforeAddPin(Node, NewPin);
 	}
 	else
 	{
@@ -1092,6 +1182,7 @@ FNiagaraScratchResult UNiagaraScratchPadService::AddModuleInput(
 	const FEdGraphPinType PinType = MakeNiagaraPinType(Type);
 	UEdGraphPin* NewPin = MapGet->CreatePin(EGPD_Output, PinType, FName(*Namespaced));
 	if (!NewPin) { R.Message = TEXT("CreatePin returned null"); return R; }
+	PlacePinBeforeAddPin(MapGet, NewPin);
 
 	Graph->NotifyGraphChanged();
 	System->MarkPackageDirty();
@@ -1146,6 +1237,7 @@ FNiagaraScratchResult UNiagaraScratchPadService::AddModuleOutput(
 	const FEdGraphPinType PinType = MakeNiagaraPinType(Type);
 	UEdGraphPin* NewPin = MapSet->CreatePin(EGPD_Input, PinType, FName(*Namespaced));
 	if (!NewPin) { R.Message = TEXT("CreatePin returned null"); return R; }
+	PlacePinBeforeAddPin(MapSet, NewPin);
 
 	Graph->NotifyGraphChanged();
 	System->MarkPackageDirty();
@@ -1162,6 +1254,92 @@ FNiagaraScratchResult UNiagaraScratchPadService::AddModuleOutput(
 
 namespace
 {
+	/**
+	 * The stack view (opening the system, GetScriptStackTopology, GetStackIssues) walks every scratch
+	 * graph through BuildParameterMapHistory, which asserts on shapes the compiler accepts. Check one
+	 * dynamic-pin node for those shapes without building a stack view. With bRepair, fix what is safe
+	 * to fix - add pins out of place (pin order only) and a Custom HLSL signature out of step with its
+	 * pins (rebuilt from the pins, as the engine's RebuildSignatureFromPins does) - and list each
+	 * repair in OutRepairs. Whatever is still wrong goes to OutErrors.
+	 */
+	void CheckNodeStackShape(UEdGraphNode* Node, const FString& Where, bool bRepair, TArray<FString>& OutErrors, TArray<FString>& OutRepairs)
+	{
+		if (!Node || !Cast<UNiagaraNodeWithDynamicPins>(Node)) return;
+
+		if (!HasAddPinsLast(Node))
+		{
+			if (bRepair && MoveAddPinsLast(Node))
+			{
+				OutRepairs.Add(FString::Printf(TEXT("%s: moved the add pins behind the real pins."), *Where));
+			}
+			else
+			{
+				OutErrors.Add(FString::Printf(TEXT("%s: a real pin sits behind the add pin; building the stack view would crash the editor. Run verify_stack(path, True) to repair the pin order."), *Where));
+				return;
+			}
+		}
+
+		auto* Hlsl = Cast<UNiagaraNodeCustomHlsl>(Node);
+		if (!Hlsl) return;
+
+		TArray<FName> InputNames;
+		TArray<FName> OutputNames;
+		for (const UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin || IsDynamicAddPin(Pin)) continue;
+			(Pin->Direction == EGPD_Input ? InputNames : OutputNames).Add(Pin->PinName);
+		}
+		// Signature inputs are FNiagaraVariable, outputs FNiagaraVariableBase.
+		auto SignatureMatches = [](const TArray<FName>& Names, const auto& Vars)
+		{
+			if (Names.Num() != Vars.Num()) return false;
+			for (int32 i = 0; i < Names.Num(); ++i)
+			{
+				if (Names[i] != Vars[i].GetName()) return false;
+			}
+			return true;
+		};
+		const FNiagaraFunctionSignature& Sig = Hlsl->Signature;
+		if (!SignatureMatches(InputNames, Sig.Inputs) || !SignatureMatches(OutputNames, Sig.Outputs))
+		{
+			const FString Counts = FString::Printf(TEXT("pins %d in / %d out, signature %d in / %d out"),
+				InputNames.Num(), OutputNames.Num(), Sig.Inputs.Num(), Sig.Outputs.Num());
+			if (bRepair)
+			{
+				RebuildCustomHlslSignatureFromPins(Hlsl);
+				OutRepairs.Add(FString::Printf(TEXT("%s: rebuilt the Custom HLSL signature from its pins (%s)."), *Where, *Counts));
+			}
+			else
+			{
+				OutErrors.Add(FString::Printf(TEXT("%s: Custom HLSL pins and signature differ (%s); the stack view pairs them by index. Run verify_stack(path, True) to rebuild the signature."), *Where, *Counts));
+			}
+		}
+	}
+
+	/** CheckNodeStackShape over every node of every emitter scratch module. */
+	void CheckStackShapes(UNiagaraSystem* System, bool bRepair, TArray<FString>& OutErrors, TArray<FString>& OutRepairs)
+	{
+		for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+		{
+			const FVersionedNiagaraEmitterData* EmitterData = Handle.GetEmitterData();
+			if (!EmitterData || !EmitterData->ScratchPads) continue;
+			for (UNiagaraScript* Scratch : EmitterData->ScratchPads->Scripts)
+			{
+				if (!Scratch) continue;
+				const auto* Src = Cast<UNiagaraScriptSource>(Scratch->GetLatestSource());
+				if (!Src || !Src->NodeGraph) continue;
+
+				for (UEdGraphNode* Node : Src->NodeGraph->Nodes)
+				{
+					if (!Node || !Cast<UNiagaraNodeWithDynamicPins>(Node)) continue;
+					const FString Where = FString::Printf(TEXT("Scratch module '%s' (emitter '%s'), %s node %s"),
+						*Scratch->GetName(), *Handle.GetName().ToString(), *GetNodeTypeLabel(Node), *Node->NodeGuid.ToString());
+					CheckNodeStackShape(Node, Where, bRepair, OutErrors, OutRepairs);
+				}
+			}
+		}
+	}
+
 	// A scratch module left with duplicate same-named pins on a Map Get/Set node (the
 	// pre-7bca8ce non-idempotency, or manual edits) makes ANY later system compile fire
 	// a fatal "Array index out of bounds" assert inside ReallocatePins — taking down the
@@ -1255,18 +1433,84 @@ namespace
 #endif
 		}
 	}
+
+	/**
+	 * Build the system's stack view the way the Niagara editor does and collect its issues. This is
+	 * the same path that crashed on a misordered Custom HLSL node, so call it only after
+	 * CheckStackShapes found nothing: it then proves the stack view really builds, and reports what
+	 * the editor's stack would show (missing inputs, bad links, script errors). Warnings and info
+	 * are added only when OutWarnings is given.
+	 */
+	void CollectStackViewIssues(UNiagaraSystem* System, TArray<FString>& OutErrors, TArray<FString>* OutWarnings)
+	{
+		if (System->HasActiveCompilations() || System->HasOutstandingCompilationRequests(false))
+		{
+			System->WaitForCompilationComplete();
+		}
+		FNiagaraExternalEditContext Context(System);
+		FNiagaraExt_StackIssues Issues;
+		UNiagaraExternalEditUtilities::GetStackIssues(System, Issues, Context);
+		for (const FText& Error : Context.Errors)
+		{
+			OutErrors.Add(FString::Printf(TEXT("Stack view: %s"), *Error.ToString()));
+		}
+		for (const FNiagaraExt_StackIssue& Issue : Issues.Issues)
+		{
+			const FString Line = FString::Printf(TEXT("[%s] %s%s%s"), *Issue.StackDisplayPath, *Issue.ShortDescription,
+				Issue.LongDescription.IsEmpty() ? TEXT("") : TEXT(" - "), *Issue.LongDescription);
+			if (Issue.Severity == ENiagaraExt_StackIssueSeverity::Error)
+			{
+				OutErrors.Add(TEXT("Stack error: ") + Line);
+			}
+			else if (OutWarnings && Issue.Severity != ENiagaraExt_StackIssueSeverity::None)
+			{
+				OutWarnings->Add((Issue.Severity == ENiagaraExt_StackIssueSeverity::Warning ? TEXT("Stack warning: ") : TEXT("Stack info: ")) + Line);
+			}
+		}
+	}
+
+	// Messages from the last ApplyChanges, per system path; read through GetLastApplyReport.
+	TMap<FString, TArray<FString>> GScratchPadLastApplyReport;
 }
 
 bool UNiagaraScratchPadService::ApplyChanges(const FString& SystemPath)
 {
+	TArray<FString>& Report = GScratchPadLastApplyReport.FindOrAdd(SystemPath);
+	Report.Reset();
+	auto Fail = [&Report](const FString& Msg)
+	{
+		UE_LOG(LogTemp, Error, TEXT("ApplyChanges: %s"), *Msg);
+		Report.Add(TEXT("Error: ") + Msg);
+	};
+
 	UNiagaraSystem* System = LoadSystem(SystemPath);
-	if (!System) return false;
+	if (!System)
+	{
+		Fail(FString::Printf(TEXT("failed to load Niagara system '%s'"), *SystemPath));
+		return false;
+	}
 
 	// Refuse to compile a corrupt scratch graph — the engine assert it would fire is fatal.
 	FString ValidationError;
 	if (!ValidateScratchGraphsForCompile(System, ValidationError))
 	{
-		UE_LOG(LogTemp, Error, TEXT("ApplyChanges: %s"), *ValidationError);
+		Fail(ValidationError);
+		return false;
+	}
+
+	// Repair the shapes the stack view would assert on (safe repairs only), refuse the rest. The
+	// compile alone does not catch them: it passed on the graph that later crashed the editor.
+	TArray<FString> ShapeErrors;
+	TArray<FString> Repairs;
+	CheckStackShapes(System, /*bRepair=*/true, ShapeErrors, Repairs);
+	for (const FString& Repair : Repairs)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ApplyChanges: repaired %s"), *Repair);
+		Report.Add(TEXT("Repaired: ") + Repair);
+	}
+	if (ShapeErrors.Num() > 0)
+	{
+		for (const FString& Msg : ShapeErrors) Fail(Msg);
 		return false;
 	}
 
@@ -1302,21 +1546,80 @@ bool UNiagaraScratchPadService::ApplyChanges(const FString& SystemPath)
 	System->RequestCompile(false);
 	System->WaitForCompilationComplete();
 
-	UEditorAssetLibrary::SaveLoadedAsset(System);
-
 	// Surface the real compiler diagnostics instead of a bare true/false — a compile
 	// with errors is a failure the caller must see (issues #432, #352).
 	TArray<FString> CompileErrors;
 	CollectCompileMessages(System, /*bErrorsOnly=*/true, CompileErrors);
-	if (CompileErrors.Num() > 0)
+	for (const FString& Msg : CompileErrors)
 	{
-		for (const FString& Msg : CompileErrors)
-		{
-			UE_LOG(LogTemp, Error, TEXT("ApplyChanges: %s"), *Msg);
-		}
+		UE_LOG(LogTemp, Error, TEXT("ApplyChanges: %s"), *Msg);
+		Report.Add(Msg);
+	}
+
+	// A clean compile does not prove the stack view builds; build it and read its errors.
+	TArray<FString> StackErrors;
+	CollectStackViewIssues(System, StackErrors, nullptr);
+	for (const FString& Msg : StackErrors) Fail(Msg);
+
+	// Save only a system that compiled and whose stack view built cleanly: a saved broken module
+	// crashes whoever opens the system next. A failed system stays dirty in memory.
+	if (CompileErrors.Num() > 0 || StackErrors.Num() > 0)
+	{
+		Report.Add(TEXT("Not saved: the system stays dirty in memory until the errors are fixed."));
 		return false;
 	}
+	UEditorAssetLibrary::SaveLoadedAsset(System);
 	return true;
+}
+
+TArray<FString> UNiagaraScratchPadService::GetLastApplyReport(const FString& SystemPath)
+{
+	const TArray<FString>* Report = GScratchPadLastApplyReport.Find(SystemPath);
+	return Report ? *Report : TArray<FString>();
+}
+
+TArray<FString> UNiagaraScratchPadService::VerifyStack(const FString& SystemPath, bool bRepair, bool bIncludeWarnings)
+{
+	TArray<FString> Lines;
+	UNiagaraSystem* System = LoadSystem(SystemPath);
+	if (!System)
+	{
+		Lines.Add(FString::Printf(TEXT("Error: failed to load Niagara system '%s'"), *SystemPath));
+		return Lines;
+	}
+
+	TArray<FString> Errors;
+	TArray<FString> Repairs;
+	FString DuplicateError;
+	if (!ValidateScratchGraphsForCompile(System, DuplicateError))
+	{
+		Errors.Add(DuplicateError);
+	}
+	CheckStackShapes(System, bRepair, Errors, Repairs);
+	for (const FString& Repair : Repairs)
+	{
+		Lines.Add(TEXT("Repaired: ") + Repair);
+	}
+	if (Repairs.Num() > 0)
+	{
+		System->MarkPackageDirty();
+	}
+
+	// Building the stack view on a graph with a known crash shape would take the editor down;
+	// report the shapes and stop there.
+	if (Errors.Num() > 0)
+	{
+		for (const FString& Msg : Errors) Lines.Add(TEXT("Error: ") + Msg);
+		Lines.Add(TEXT("Error: stack view not built (fix the errors above first)."));
+		return Lines;
+	}
+
+	TArray<FString> StackErrors;
+	TArray<FString> StackWarnings;
+	CollectStackViewIssues(System, StackErrors, bIncludeWarnings ? &StackWarnings : nullptr);
+	for (const FString& Msg : StackErrors) Lines.Add(TEXT("Error: ") + Msg);
+	for (const FString& Msg : StackWarnings) Lines.Add(TEXT("Warning: ") + Msg);
+	return Lines;
 }
 
 TArray<FString> UNiagaraScratchPadService::GetCompileMessages(const FString& SystemPath, bool bErrorsOnly)
@@ -1331,5 +1634,73 @@ TArray<FString> UNiagaraScratchPadService::GetCompileMessages(const FString& Sys
 	CollectCompileMessages(System, bErrorsOnly, Messages);
 	return Messages;
 }
+
+#if WITH_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+
+// A pin made with a bare CreatePin lands behind the "+" add pin, and the stack view then reads past
+// the end of the Custom HLSL signature (editor crash). The check must see that shape, the repair must
+// fix it, and the service's own pin placement must never make it. Runs on a transient graph: no
+// asset, no compile, no stack view.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVibeNiagaraScratchAddPinOrderTest, "VibeUE.Niagara.ScratchPad.AddPinOrder",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FVibeNiagaraScratchAddPinOrderTest::RunTest(const FString& Parameters)
+{
+	UNiagaraGraph* Graph = NewObject<UNiagaraGraph>(GetTransientPackage(), NAME_None, RF_Transient);
+	FGraphNodeCreator<UNiagaraNodeCustomHlsl> Creator(*Graph);
+	UNiagaraNodeCustomHlsl* Node = Creator.CreateNode();
+	Creator.Finalize();
+	if (!TestNotNull(TEXT("Custom HLSL node"), Node)) return false;
+
+	int32 AddPins = 0;
+	for (const UEdGraphPin* Pin : Node->Pins) { AddPins += IsDynamicAddPin(Pin) ? 1 : 0; }
+	if (!TestTrue(TEXT("a new Custom HLSL node has add pins (positive control for the order checks)"), AddPins > 0)) return false;
+	TestTrue(TEXT("a new node already has its add pins last"), HasAddPinsLast(Node));
+
+	const FEdGraphPinType FloatPin = MakeNiagaraPinType(FNiagaraTypeDefinition::GetFloatDef());
+	TArray<FString> Errors;
+	TArray<FString> Repairs;
+
+	// The old service: a bare CreatePin, then the signature rebuilt from the pins.
+	Node->CreatePin(EGPD_Input, FloatPin, TEXT("A"));
+	RebuildCustomHlslSignatureFromPins(Node);
+	TestFalse(TEXT("a bare CreatePin leaves the pin behind the add pin"), HasAddPinsLast(Node));
+	CheckNodeStackShape(Node, TEXT("test"), /*bRepair=*/false, Errors, Repairs);
+	TestEqual(TEXT("the check reports the misplaced pin"), Errors.Num(), 1);
+	TestEqual(TEXT("a check without repair repairs nothing"), Repairs.Num(), 0);
+	TestFalse(TEXT("a check without repair leaves the order as it was"), HasAddPinsLast(Node));
+
+	Errors.Reset();
+	CheckNodeStackShape(Node, TEXT("test"), /*bRepair=*/true, Errors, Repairs);
+	TestEqual(TEXT("repair leaves no error"), Errors.Num(), 0);
+	TestEqual(TEXT("repair reports one repair"), Repairs.Num(), 1);
+	TestTrue(TEXT("repair puts the add pins last"), HasAddPinsLast(Node));
+
+	// The fixed service: CreatePin, then PlacePinBeforeAddPin.
+	UEdGraphPin* B = Node->CreatePin(EGPD_Input, FloatPin, TEXT("B"));
+	PlacePinBeforeAddPin(Node, B);
+	TestTrue(TEXT("PlacePinBeforeAddPin keeps the add pins last"), HasAddPinsLast(Node));
+
+	// A pin the signature does not know yet: the stack view pairs pins and signature by index.
+	Errors.Reset();
+	Repairs.Reset();
+	CheckNodeStackShape(Node, TEXT("test"), /*bRepair=*/false, Errors, Repairs);
+	TestEqual(TEXT("the check reports a signature out of step with the pins"), Errors.Num(), 1);
+	CheckNodeStackShape(Node, TEXT("test"), /*bRepair=*/true, Errors, Repairs);
+	TestEqual(TEXT("repair rebuilds the signature"), Repairs.Num(), 1);
+	if (TestEqual(TEXT("signature inputs after repair"), Node->Signature.Inputs.Num(), 2))
+	{
+		TestEqual(TEXT("signature input 0"), Node->Signature.Inputs[0].GetName(), FName(TEXT("A")));
+		TestEqual(TEXT("signature input 1"), Node->Signature.Inputs[1].GetName(), FName(TEXT("B")));
+	}
+
+	Errors.Reset();
+	Repairs.Reset();
+	CheckNodeStackShape(Node, TEXT("test"), /*bRepair=*/false, Errors, Repairs);
+	TestEqual(TEXT("a repaired node checks clean"), Errors.Num(), 0);
+	return true;
+}
+#endif // WITH_AUTOMATION_TESTS
 
 #undef LOCTEXT_NAMESPACE

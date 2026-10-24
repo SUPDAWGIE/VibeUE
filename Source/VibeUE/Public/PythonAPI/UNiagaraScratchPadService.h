@@ -206,6 +206,17 @@ public:
 		const FString& SystemPath,
 		const FString& EmitterName);
 
+	/**
+	 * Names of the system's emitters, in handle order. Reads the system only: unlike the NiagaraToolsets
+	 * queries it builds no stack view, so it is safe on a system whose stack view would crash.
+	 *
+	 * Example:
+	 *   for name in unreal.NiagaraScratchPadService.list_emitters("/Game/VFX/NS_Fx"):
+	 *       print(name)
+	 */
+	UFUNCTION(BlueprintCallable, Category = "VibeUE|NiagaraScratch", meta = (AICallable, DisplayName = "List Emitters"))
+	static TArray<FString> ListEmitters(const FString& SystemPath);
+
 	// =================================================================
 	// Graph inspection
 	// =================================================================
@@ -469,18 +480,52 @@ public:
 	 *
 	 * Before compiling, the scratch graphs are validated (e.g. duplicate same-named pins on Map Get/Set
 	 * nodes, which would fire a fatal engine assert inside RequestCompile) — a corrupt graph fails fast
-	 * with a clear error instead of crashing the editor. On compile errors, the real per-script Niagara
-	 * compiler messages are logged and False is returned; fetch them with get_compile_messages.
+	 * with a clear error instead of crashing the editor. Shapes that only the stack view asserts on
+	 * (a real pin behind a node's "+" add pin, a Custom HLSL signature out of step with its pins) are
+	 * repaired in place and reported. After the compile, the system's stack view is built the way the
+	 * Niagara editor builds it and its errors count as failures: a clean compile alone is not proof
+	 * that the system opens. The system is saved only when compile and stack view are both clean;
+	 * otherwise it stays dirty in memory. The reasons are in get_last_apply_report.
 	 *
-	 * @return True if validation and recompilation succeeded with no errors
+	 * @return True if validation, recompilation and the stack view all succeeded with no errors
 	 *
 	 * Example:
 	 *   ok = unreal.NiagaraScratchPadService.apply_changes("/Game/VFX/NS_Fx")
-	 *   if not ok:
-	 *       print(unreal.NiagaraScratchPadService.get_compile_messages("/Game/VFX/NS_Fx"))
+	 *   for line in unreal.NiagaraScratchPadService.get_last_apply_report("/Game/VFX/NS_Fx"):
+	 *       print(line)
 	 */
 	UFUNCTION(BlueprintCallable, Category = "VibeUE|NiagaraScratch", meta = (AICallable, DisplayName = "Apply Scratch Changes"))
 	static bool ApplyChanges(const FString& SystemPath);
+
+	/**
+	 * The messages of the last apply_changes on this system, one per line: "Repaired: ...",
+	 * "Error: ..." (validation, compile or stack view) and "Not saved: ...". Empty after a clean apply
+	 * with nothing repaired, or when apply_changes has not run on this path in this editor session.
+	 *
+	 * @param SystemPath - Full path to the Niagara System asset, exactly as passed to apply_changes
+	 */
+	UFUNCTION(BlueprintCallable, Category = "VibeUE|NiagaraScratch", meta = (AICallable, DisplayName = "Get Last Apply Report"))
+	static TArray<FString> GetLastApplyReport(const FString& SystemPath);
+
+	/**
+	 * Check that the system's stack view builds, without compiling or saving. First the scratch graphs
+	 * are checked for the shapes that crash the stack view (duplicate Map Get/Set pins, a real pin behind
+	 * an add pin, a Custom HLSL signature out of step with its pins); if any is found, the stack view is
+	 * NOT built and the shapes are reported. Otherwise the stack view is built as the Niagara editor
+	 * builds it and its issues are returned. Works on any system, not only ones with scratch modules.
+	 *
+	 * @param SystemPath       - Full path to the Niagara System asset
+	 * @param bRepair          - Repair the safe shapes in place (pin order, Custom HLSL signature) and
+	 *                           mark the system dirty; nothing is saved
+	 * @param bIncludeWarnings - Also return stack warnings and info
+	 * @return Lines prefixed "Repaired:", "Error:" or "Warning:"; empty means the stack view built clean
+	 *
+	 * Example:
+	 *   problems = unreal.NiagaraScratchPadService.verify_stack("/Game/VFX/NS_Fx_Copy", True)
+	 *   assert not [p for p in problems if p.startswith("Error")], problems
+	 */
+	UFUNCTION(BlueprintCallable, Category = "VibeUE|NiagaraScratch", meta = (AICallable, DisplayName = "Verify Stack View"))
+	static TArray<FString> VerifyStack(const FString& SystemPath, bool bRepair = false, bool bIncludeWarnings = false);
 
 	/**
 	 * Get the real Niagara compiler diagnostics from the system's last compile — one line per issue,

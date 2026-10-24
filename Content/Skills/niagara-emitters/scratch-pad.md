@@ -117,12 +117,11 @@ for v in ["StartPositions","EndPositions","TireRadius","VolumeMin","VolumeMax","
 unreal.NiagaraScratchPadService.add_module_output(S, E, MOD, "Particles.Splatted", "bool")
 unreal.NiagaraScratchPadService.connect_pins(S, E, MOD, HLSL, "Splatted", mapset, "Particles.Splatted")
 
-# 6. Apply + recompile + save (one call)
+# 6. Apply + recompile + verify the stack view + save (one call)
 ok = unreal.NiagaraScratchPadService.apply_changes(S)
-if not ok:
-    # Real per-script compiler diagnostics — no more guessing from "System is invalid"
-    for line in unreal.NiagaraScratchPadService.get_compile_messages(S):
-        print(line)
+# Repairs, compile errors, stack-view errors and "Not saved" -- one line each
+for line in unreal.NiagaraScratchPadService.get_last_apply_report(S):
+    print(line)
 ```
 
 ### Compile failures are debuggable now
@@ -130,6 +129,22 @@ if not ok:
 - `apply_changes` **validates the scratch graphs before compiling** (duplicate same-named Map
   Get/Set pins used to fire a fatal engine assert and crash the editor — now it refuses with an
   error naming the node/pin) and returns `False` when the compile produced errors.
+- **A clean compile does not prove the system opens.** The stack view (opening the system in the
+  Niagara editor, or any engine `NiagaraToolsets` query, which builds the same view) walks the
+  graph through a different path than the compiler. Older builds of this service added Custom
+  HLSL, Map Get and Map Set pins *behind* the node's "+" add pin; that compiled clean and then
+  crashed the editor with `Array index out of bounds: 4 into an array of size 4` in
+  `UNiagaraNodeCustomHlsl::BuildParameterMapHistory` the moment a stack view was built. New pins
+  now go in front of the add pin, and `apply_changes` (a) repairs the pin order and a Custom HLSL
+  signature out of step with its pins on graphs made by older builds, (b) builds the stack view
+  after the compile and fails on its errors, and (c) saves only when compile and stack view are
+  both clean. Read the reasons with `get_last_apply_report(S)`.
+- `verify_stack(S, repair=False, include_warnings=False)` runs the same checks without compiling
+  or saving: it reports a crash-shaped graph without building the stack view, otherwise builds it
+  and returns its issues (`"Error: ..."`, `"Warning: ..."`, `"Repaired: ..."`; empty = clean). Use
+  it before opening a system someone else built with this service.
+- `list_emitters(S)` names the emitters without building a stack view (safe on a broken system,
+  unlike the `NiagaraToolsets` summary queries).
 - `get_compile_messages(system_path, errors_only=True)` returns the actual Niagara translator
   messages per script (`"Error: [Emitter/Script] message (node <guid>)"`). Call it after any failed
   compile instead of bisecting the graph.
@@ -198,9 +213,11 @@ on the Map Get node is likewise `Module.<Name>` — list pins with `get_node_pin
 ### What `apply_changes` does
 
 A single call:
-1. Walks every stack module across every emitter and calls `RefreshFromExternalChanges()` on each one referencing a scratch script (so new module inputs/outputs propagate to the stack UI).
-2. Calls `FNiagaraStackGraphUtilities::RebuildEmitterNodes` to rebuild the system's compiled emitter nodes.
-3. Marks dirty, recompiles, waits, saves.
+1. Refuses duplicate same-named Map Get/Set pins; repairs add-pin order and Custom HLSL signatures.
+2. Notifies every scratch graph so the stack function calls pick up the new signature on compile.
+3. Marks dirty, recompiles, waits, and collects the compiler errors.
+4. Builds the stack view and collects its errors.
+5. Saves only if steps 3 and 4 found no error; otherwise the system stays dirty in memory.
 
 Call it **once** at the end of a batch of graph edits — not after every node creation.
 

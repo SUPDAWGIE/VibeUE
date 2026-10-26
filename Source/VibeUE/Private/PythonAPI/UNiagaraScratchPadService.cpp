@@ -11,6 +11,7 @@
 
 // Niagara runtime
 #include "NiagaraCommon.h"
+#include "NiagaraDataInterface.h"
 #include "NiagaraEmitter.h"
 #include "NiagaraEmitterHandle.h"
 #include "NiagaraScratchPadContainer.h"
@@ -363,6 +364,63 @@ namespace
 				Sig.Outputs.Add(Schema->PinToNiagaraVariable(Pin, /*bNeedsValue*/false));
 			}
 		}
+	}
+
+	/**
+	 * Replicate UNiagaraNodeFunctionCall::RefreshSignature (protected and not exported): a data
+	 * interface function with a variadic signature (DataChannelRead.Read, DataChannelWrite.Write)
+	 * starts again from the interface's base signature and gains one input or output per dynamic
+	 * pin, in pin order. The engine runs it after RequestNewTypedPin; a pin made by CreatePin alone is
+	 * not in the signature, so the translator never emits it and the stack view pairs pins with a
+	 * signature that is too short. Returns false when the node is not such a call.
+	 */
+	bool RebuildDataInterfaceSignatureFromPins(UNiagaraNodeFunctionCall* FnCall)
+	{
+		if (!FnCall) return false;
+		const FNiagaraFunctionSignature& Current = FnCall->Signature;
+		if (!Current.IsValid() || !Current.bMemberFunction || Current.Inputs.Num() == 0 || !Current.Inputs[0].GetType().IsDataInterface())
+		{
+			return false;
+		}
+		UClass* DIClass = Current.Inputs[0].GetType().GetClass();
+		const UNiagaraDataInterface* CDO = DIClass ? Cast<UNiagaraDataInterface>(DIClass->GetDefaultObject()) : nullptr;
+		if (!CDO) return false;
+		TArray<FNiagaraFunctionSignature> BaseFunctions;
+		CDO->GetFunctionSignatures(BaseFunctions);
+		const FNiagaraFunctionSignature* BaseSig = BaseFunctions.FindByPredicate(
+			[&Current](const FNiagaraFunctionSignature& Candidate) { return Candidate.Name == Current.Name; });
+		if (!BaseSig) return false;
+
+		FnCall->Modify();
+		FNiagaraFunctionSignature Rebuilt = *BaseSig;
+		for (const UEdGraphPin* Pin : FnCall->Pins)
+		{
+			// The engine also skips exec pins (UNiagaraNodeWithDynamicPins::IsExecPin, unexported): the
+			// parameter-map pins a function that requires an exec pin carries on each side.
+			if (!Pin || IsDynamicAddPin(Pin) || Pin->bOrphanedPin
+				|| UEdGraphSchema_Niagara::PinToTypeDefinition(Pin) == FNiagaraTypeDefinition::GetParameterMapDef())
+			{
+				continue;
+			}
+			if (Pin->Direction == EGPD_Input)
+			{
+				const FNiagaraVariable Variable = UEdGraphSchema_Niagara::PinToNiagaraVariable(Pin, /*bNeedsValue*/true);
+				if (!BaseSig->Inputs.Contains(Variable))
+				{
+					Rebuilt.AddInput(Variable, FText::FromString(Pin->PinToolTip));
+				}
+			}
+			else
+			{
+				const FNiagaraVariable Variable = UEdGraphSchema_Niagara::PinToNiagaraVariable(Pin, /*bNeedsValue*/false);
+				if (!BaseSig->Outputs.Contains(Variable))
+				{
+					Rebuilt.AddOutput(Variable, FText::FromString(Pin->PinToolTip));
+				}
+			}
+		}
+		FnCall->Signature = Rebuilt;
+		return true;
 	}
 
 	/** Build an FEdGraphPinType for a Niagara type using the exported schema helper. */
@@ -964,6 +1022,20 @@ FNiagaraScratchResult UNiagaraScratchPadService::AddPin(
 		// and wipes the new pin. We rebuild Signature directly from the current pin set.
 		RebuildCustomHlslSignatureFromPins(Node);
 	}
+	else if (UNiagaraNodeFunctionCall* FnCall = Cast<UNiagaraNodeFunctionCall>(Node);
+		FnCall && (FnCall->Signature.VariadicInput() || FnCall->Signature.VariadicOutput()))
+	{
+		// A data interface call that takes its inputs or outputs from its pins (a data channel's
+		// Read or Write): the pin must also join the signature, as the engine's RequestNewTypedPin does.
+		NewPin = Node->CreatePin(Dir, PinType, FName(*PinName));
+		PlacePinBeforeAddPin(Node, NewPin);
+		if (!RebuildDataInterfaceSignatureFromPins(FnCall))
+		{
+			Node->RemovePin(NewPin);
+			R.Message = TEXT("Variadic function call without a data interface base signature");
+			return R;
+		}
+	}
 	else if (Cast<UNiagaraNodeWithDynamicPins>(Node) != nullptr)
 	{
 		// Generic dynamic-pin node (Op, If, etc.)
@@ -979,6 +1051,93 @@ FNiagaraScratchResult UNiagaraScratchPadService::AddPin(
 	if (!NewPin) { R.Message = TEXT("CreatePin returned null"); return R; }
 	R.bSuccess = true; R.Message = NewPin->PinName.ToString(); R.NodeId = NodeId;
 
+	Graph->NotifyGraphChanged();
+	System->MarkPackageDirty();
+	return R;
+}
+
+FNiagaraScratchResult UNiagaraScratchPadService::RemovePin(
+	const FString& SystemPath,
+	const FString& EmitterName,
+	const FString& ModuleName,
+	const FString& NodeId,
+	const FString& Direction,
+	const FString& PinName)
+{
+	FNiagaraScratchResult R;
+	UNiagaraSystem* System = LoadSystem(SystemPath);
+	if (!System) { R.Message = TEXT("System not found"); return R; }
+	FNiagaraEmitterHandle* Handle = FindEmitterHandle(System, EmitterName);
+	if (!Handle) { R.Message = TEXT("Emitter not found"); return R; }
+	UNiagaraNodeFunctionCall* Call = FindModuleNodeOnEmitter(Handle->GetEmitterData(), ModuleName);
+	UNiagaraGraph* Graph = GetScratchGraphFromCall(Call);
+	UEdGraphNode* Node = FindNodeByGuid(Graph, NodeId);
+	if (!Node) { R.Message = TEXT("Node not found"); return R; }
+	if (!Cast<UNiagaraNodeWithDynamicPins>(Node)) { R.Message = TEXT("Node type does not support dynamic pins"); return R; }
+
+	const EEdGraphPinDirection Dir = Direction.Equals(TEXT("Output"), ESearchCase::IgnoreCase) ? EGPD_Output : EGPD_Input;
+	UEdGraphPin* Pin = nullptr;
+	for (UEdGraphPin* Candidate : Node->Pins)
+	{
+		if (Candidate && Candidate->Direction == Dir && Candidate->PinName.ToString().Equals(PinName, ESearchCase::IgnoreCase))
+		{
+			Pin = Candidate;
+			break;
+		}
+	}
+	if (!Pin) { R.Message = FString::Printf(TEXT("No %s pin named '%s'"), *Direction, *PinName); return R; }
+	if (IsDynamicAddPin(Pin) || UEdGraphSchema_Niagara::PinToTypeDefinition(Pin) == FNiagaraTypeDefinition::GetParameterMapDef())
+	{
+		R.Message = TEXT("An add pin or an exec pin cannot be removed");
+		return R;
+	}
+
+	UNiagaraNodeFunctionCall* FnCall = Cast<UNiagaraNodeFunctionCall>(Node);
+	const bool bCustomHlsl = Node->IsA<UNiagaraNodeCustomHlsl>();
+	const bool bVariadicCall = FnCall && !bCustomHlsl && (FnCall->Signature.VariadicInput() || FnCall->Signature.VariadicOutput());
+	if (FnCall && !bCustomHlsl && !bVariadicCall)
+	{
+		R.Message = TEXT("A function call without a variadic signature has no dynamic pins");
+		return R;
+	}
+	if (bVariadicCall)
+	{
+		// The base signature's own pins (the Read's Emit and the like) belong to the function itself.
+		const FNiagaraFunctionSignature& Current = FnCall->Signature;
+		UClass* DIClass = Current.Inputs.Num() > 0 && Current.Inputs[0].GetType().IsDataInterface() ? Current.Inputs[0].GetType().GetClass() : nullptr;
+		const UNiagaraDataInterface* CDO = DIClass ? Cast<UNiagaraDataInterface>(DIClass->GetDefaultObject()) : nullptr;
+		TArray<FNiagaraFunctionSignature> BaseFunctions;
+		if (CDO)
+		{
+			CDO->GetFunctionSignatures(BaseFunctions);
+		}
+		const FNiagaraFunctionSignature* BaseSig = BaseFunctions.FindByPredicate(
+			[&Current](const FNiagaraFunctionSignature& Candidate) { return Candidate.Name == Current.Name; });
+		if (!BaseSig) { R.Message = TEXT("Variadic function call without a data interface base signature"); return R; }
+		const FNiagaraVariable Variable = UEdGraphSchema_Niagara::PinToNiagaraVariable(Pin, Dir == EGPD_Input);
+		const bool bBasePin = Dir == EGPD_Input ? BaseSig->Inputs.Contains(Variable) : BaseSig->Outputs.Contains(Variable);
+		if (bBasePin)
+		{
+			R.Message = FString::Printf(TEXT("'%s' belongs to the function's base signature"), *PinName);
+			return R;
+		}
+	}
+
+	Graph->Modify();
+	Node->Modify();
+	const FString Removed = Pin->PinName.ToString();
+	Pin->BreakAllPinLinks(true);
+	Node->RemovePin(Pin);
+	if (bCustomHlsl)
+	{
+		RebuildCustomHlslSignatureFromPins(Node);
+	}
+	else if (bVariadicCall)
+	{
+		RebuildDataInterfaceSignatureFromPins(FnCall);
+	}
+
+	R.bSuccess = true; R.Message = Removed; R.NodeId = NodeId;
 	Graph->NotifyGraphChanged();
 	System->MarkPackageDirty();
 	return R;

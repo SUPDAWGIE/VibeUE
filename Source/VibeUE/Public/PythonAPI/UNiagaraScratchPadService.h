@@ -373,6 +373,29 @@ public:
 		const FString& PinName);
 
 	/**
+	 * Remove a dynamic pin (one AddPin could have made) from a scratch-graph node, breaking its links:
+	 * a Map Get / Map Set parameter, a Custom HLSL input or output, or an input or output of a data
+	 * interface call with a variadic signature (a data channel's Read or Write). The node's signature
+	 * is rebuilt the way AddPin builds it, so pins and signature stay paired. Refuses an add pin, an
+	 * exec pin and a pin of a data interface function's base signature.
+	 *
+	 * @param Direction "Input" or "Output"
+	 * @param PinName   the pin's name as list_nodes reports it
+	 * @return Result with the removed pin's name in Message on success
+	 *
+	 * Example:
+	 *   unreal.NiagaraScratchPadService.remove_pin(S, E, mod, read_id, "Output", "Hue")
+	 */
+	UFUNCTION(BlueprintCallable, Category = "VibeUE|NiagaraScratch", meta = (AICallable, DisplayName = "Remove Scratch Pin"))
+	static FNiagaraScratchResult RemovePin(
+		const FString& SystemPath,
+		const FString& EmitterName,
+		const FString& ModuleName,
+		const FString& NodeId,
+		const FString& Direction,
+		const FString& PinName);
+
+	/**
 	 * Delete a node from the scratch graph.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "VibeUE|NiagaraScratch", meta = (AICallable, DisplayName = "Delete Scratch Node"))

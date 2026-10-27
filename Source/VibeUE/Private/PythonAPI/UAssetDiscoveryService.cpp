@@ -565,10 +565,12 @@ FUnattendedDeleteResult UAssetDiscoveryService::DeleteAssetUnattended(const FStr
 
 	// The registry lags a freshly saved referencer (a montage built on this clip seconds ago is
 	// not in its dependency map yet), so also ask memory: every loaded asset package that holds
-	// a pointer to this object counts. Transient / compiled-in outers are the Python wrapper and
-	// the editor itself, not references worth refusing over.
+	// a strong pointer to this object counts. Weak Blueprint reverse-dependency caches do not
+	// keep the asset alive and must not turn its parent into a deletion-blocking consumer.
+	// Transient / compiled-in outers are the Python wrapper and the editor itself, not references
+	// worth refusing over. The registry and native GC-root checks remain independent guards.
 	const TArray<UObject*> Referencees = { Asset };
-	for (UObject* Referencer : FReferencerFinder::GetAllReferencers(Referencees, nullptr))
+	for (UObject* Referencer : FReferencerFinder::GetAllReferencers(Referencees, nullptr, EReferencerFinderFlags::SkipWeakReferences))
 	{
 		UPackage* Package = Referencer ? Referencer->GetOutermost() : nullptr;
 		if (!Package || Package == Asset->GetOutermost() || Package == GetTransientPackage() || Package->HasAnyPackageFlags(PKG_CompiledIn))
